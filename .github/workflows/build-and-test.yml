@@ -14,7 +14,7 @@ env:
 
 jobs:
   detect-changes:
-    runs-on: ubuntu-latest
+    runs-on: self-hosted
     outputs:
       web-app: ${{ steps.changes.outputs.web-app }}
       api-service: ${{ steps.changes.outputs.api-service }}
@@ -42,7 +42,7 @@ jobs:
   build-and-test:
     needs: detect-changes
     if: needs.detect-changes.outputs.web-app == 'true' || needs.detect-changes.outputs.api-service == 'true'
-    runs-on: ubuntu-latest
+    runs-on: self-hosted
     strategy:
       matrix:
         service: 
@@ -112,7 +112,7 @@ jobs:
   integration-tests:
     needs: [detect-changes, build-and-test]
     if: needs.detect-changes.outputs.web-app == 'true' && needs.detect-changes.outputs.api-service == 'true'
-    runs-on: ubuntu-latest
+    runs-on: self-hosted
     
     services:
       postgres:
@@ -175,7 +175,7 @@ jobs:
   build-summary:
     needs: [detect-changes, build-and-test, integration-tests]
     if: always()
-    runs-on: ubuntu-latest
+    runs-on: self-hosted
     
     steps:
       - name: Build Summary

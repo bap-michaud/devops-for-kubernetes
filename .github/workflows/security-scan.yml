@@ -20,7 +20,7 @@ permissions:
 
 jobs:
   detect-changes:
-    runs-on: ubuntu-latest
+    runs-on: self-hosted
     outputs:
       web-app: ${{ steps.changes.outputs.web-app }}
       api-service: ${{ steps.changes.outputs.api-service }}
@@ -52,7 +52,7 @@ jobs:
               - '.dockerignore'
 
   sast-scanning:
-    runs-on: ubuntu-latest
+    runs-on: self-hosted
     needs: detect-changes
     if: needs.detect-changes.outputs.security-files == 'true' || github.event_name == 'schedule'
     
@@ -103,7 +103,7 @@ jobs:
           sarif_file: semgrep.sarif
 
   secret-scanning:
-    runs-on: ubuntu-latest
+    runs-on: self-hosted
     needs: detect-changes
     if: needs.detect-changes.outputs.security-files == 'true' || github.event_name == 'schedule'
     
@@ -128,7 +128,7 @@ jobs:
           GITLEAKS_LICENSE: ${{ secrets.GITLEAKS_LICENSE}}
 
   dependency-scanning:
-    runs-on: ubuntu-latest
+    runs-on: self-hosted
     needs: detect-changes
     if: needs.detect-changes.outputs.web-app == 'true' || needs.detect-changes.outputs.api-service == 'true' || github.event_name == 'schedule'
     
@@ -184,7 +184,7 @@ jobs:
           retention-days: 30
 
   container-scanning:
-    runs-on: ubuntu-latest
+    runs-on: self-hosted
     needs: detect-changes
     if: needs.detect-changes.outputs.web-app == 'true' || needs.detect-changes.outputs.api-service == 'true' || github.event_name == 'schedule'
     
@@ -255,7 +255,7 @@ jobs:
           sarif_file: 'scout-${{ matrix.service }}.sarif'
 
   kubernetes-manifest-validation:
-    runs-on: ubuntu-latest
+    runs-on: self-hosted
     needs: detect-changes
     if: needs.detect-changes.outputs.security-files == 'true' || github.event_name == 'schedule'
     
@@ -263,10 +263,8 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
 
-      - name: Set up kubectl
-        uses: azure/setup-kubectl@v3
-        with:
-          version: 'v1.28.0'
+      - name: Verify kubectl
+        run: kubectl version --client
 
       - name: Install kubeval
         run: |
@@ -311,7 +309,7 @@ jobs:
           sarif_file: polaris.sarif
 
   opa-policy-validation:
-    runs-on: ubuntu-latest
+    runs-on: self-hosted
     needs: detect-changes
     if: needs.detect-changes.outputs.security-files == 'true' || github.event_name == 'schedule'
     
@@ -371,7 +369,7 @@ jobs:
   security-summary:
     needs: [sast-scanning, secret-scanning, dependency-scanning, container-scanning, kubernetes-manifest-validation, opa-policy-validation]
     if: always()
-    runs-on: ubuntu-latest
+    runs-on: self-hosted
     
     steps:
       - name: Security Scan Summary

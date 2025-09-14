@@ -26,7 +26,7 @@ permissions:
 
 jobs:
   detect-changes:
-    runs-on: ubuntu-latest
+    runs-on: self-hosted
     outputs:
       web-app: ${{ steps.changes.outputs.web-app }}
       api-service: ${{ steps.changes.outputs.api-service }}
@@ -71,7 +71,7 @@ jobs:
   build-and-push:
     needs: detect-changes
     if: needs.detect-changes.outputs.web-app == 'true' || needs.detect-changes.outputs.api-service == 'true' || github.event.inputs.force_build == 'true'
-    runs-on: ubuntu-latest
+    runs-on: self-hosted
     strategy:
       matrix:
         service: 
@@ -148,7 +148,7 @@ jobs:
 
   merge-and-sign:
     needs: [detect-changes, build-and-push]
-    runs-on: ubuntu-latest
+    runs-on: self-hosted
     strategy:
       matrix:
         service: 
@@ -238,7 +238,7 @@ jobs:
 
   vulnerability-scan:
     needs: [detect-changes, merge-and-sign]
-    runs-on: ubuntu-latest
+    runs-on: self-hosted
     strategy:
       matrix:
         service: 
@@ -280,7 +280,7 @@ jobs:
   update-deployment-manifests:
     needs: [detect-changes, vulnerability-scan]
     if: github.ref == 'refs/heads/main' && needs.detect-changes.outputs.is-release == 'false'
-    runs-on: ubuntu-latest
+    runs-on: self-hosted
     strategy:
       matrix:
         service: 
@@ -324,7 +324,7 @@ jobs:
   build-summary:
     needs: [detect-changes, build-and-push, merge-and-sign, vulnerability-scan]
     if: always()
-    runs-on: ubuntu-latest
+    runs-on: self-hosted
     
     steps:
       - name: Build Summary

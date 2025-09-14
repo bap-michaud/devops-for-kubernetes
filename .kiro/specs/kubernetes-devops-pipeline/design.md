@@ -2,9 +2,9 @@
 
 ## Overview
 
-This design provides a comprehensive DevOps pipeline solution for Kubernetes workloads that emphasizes production readiness, security, and operational resilience. The solution includes multi-platform CI/CD implementations, detailed repository strategy analysis, and battle-tested Kubernetes configurations that support cluster operations and multi-tenancy.
+This design provides a comprehensive DevOps pipeline solution for Kubernetes workloads using a monorepo architecture that emphasizes production readiness, security, and operational resilience. The solution includes multi-platform CI/CD implementations and battle-tested Kubernetes configurations that support cluster operations and multi-tenancy.
 
-The design follows GitOps principles with clear separation of concerns between application code, infrastructure configuration, and deployment orchestration. It provides practical examples that teams can adapt to their specific needs while maintaining security and reliability standards.
+The design follows GitOps principles with clear separation of concerns between application code, infrastructure configuration, and deployment orchestration. The monorepo structure enables unified versioning, shared tooling, and atomic cross-service changes while maintaining security and reliability standards.
 
 ## Architecture
 
@@ -32,73 +32,75 @@ graph TD
     N --> P[Rollback]
 ```
 
-### Repository Strategy Architecture
+### Monorepo Architecture
 
-#### Monorepo Structure
+#### Repository Structure
 ```
 monorepo/
 ├── applications/
 │   ├── web-app/
 │   │   ├── src/
 │   │   ├── Dockerfile
+│   │   ├── package.json
 │   │   └── k8s/
 │   └── api-service/
 │       ├── src/
 │       ├── Dockerfile
+│       ├── package.json
 │       └── k8s/
 ├── shared/
 │   ├── libraries/
-│   └── configs/
+│   │   ├── logger/
+│   │   └── config/
+│   ├── configs/
+│   │   ├── eslint/
+│   │   └── jest/
+│   └── types/
 ├── infrastructure/
+│   ├── kubernetes/
+│   │   ├── base/
+│   │   └── overlays/
 │   ├── terraform/
 │   └── helm-charts/
-└── pipelines/
-    ├── .github/
-    └── .gitlab-ci/
+├── pipelines/
+│   ├── .github/
+│   │   └── workflows/
+│   └── .gitlab-ci/
+├── scripts/
+│   ├── build/
+│   ├── deploy/
+│   └── test/
+└── docs/
+    ├── architecture/
+    └── deployment/
 ```
 
-#### Multi-repo Structure
-```
-org/web-app/
-├── src/
-├── Dockerfile
-├── k8s/
-└── .github/workflows/
-
-org/api-service/
-├── src/
-├── Dockerfile
-├── k8s/
-└── .github/workflows/
-
-org/infrastructure/
-├── terraform/
-├── helm-charts/
-└── .github/workflows/
-
-org/shared-libraries/
-├── lib1/
-├── lib2/
-└── .github/workflows/
-```
+#### Build Strategy
+- **Selective Builds**: Only build changed applications and their dependencies
+- **Shared Dependencies**: Common libraries managed centrally
+- **Build Caching**: Aggressive caching for unchanged components
+- **Parallel Execution**: Independent services build in parallel
 
 ## Components and Interfaces
 
 ### CI/CD Platform Components
 
 #### 1. GitHub Actions Implementation
-- **Workflow Triggers**: Push, PR, manual dispatch
+- **Workflow Triggers**: Push, PR, manual dispatch with path-based filtering
+- **Selective Builds**: Changed service detection using git diff
 - **Build Matrix**: Multi-architecture support (amd64, arm64)
-- **Caching Strategy**: Docker layer caching, dependency caching
+- **Caching Strategy**: Docker layer caching, dependency caching, build artifacts
 - **Security Integration**: OIDC authentication, secret management
 - **Deployment Gates**: Environment protection rules
+- **Monorepo Features**: Reusable workflows, shared actions, dependency management
 
 #### 2. GitLab CI Implementation  
-- **Pipeline Stages**: Build, test, security, deploy
+- **Pipeline Stages**: Build, test, security, deploy with selective execution
 - **Dynamic Environments**: Review apps, staging, production
 - **Registry Integration**: Built-in container registry
 - **Security Features**: SAST, DAST, container scanning
 - **Deployment Strategies**: Blue-green, canary deployments
+- **Monorepo Features**: Rules-based job execution, shared templates, artifact management
 
 
 
@@ -194,28 +196,26 @@ container:
     preStop: Handler
 ```
 
-### Repository Strategy Decision Matrix
+### Monorepo Configuration Model
 ```yaml
-decision_factors:
-  team_size:
-    small: "< 10 developers"
-    medium: "10-50 developers"  
-    large: "> 50 developers"
+monorepo_config:
+  structure:
+    applications: "Service applications with independent deployments"
+    shared: "Common libraries and configurations"
+    infrastructure: "Kubernetes manifests and infrastructure code"
+    pipelines: "CI/CD configurations and workflows"
   
-  project_complexity:
-    simple: "Single application"
-    moderate: "2-5 related services"
-    complex: "> 5 services with dependencies"
+  build_strategy:
+    selective_builds: true
+    dependency_tracking: true
+    parallel_execution: true
+    caching_enabled: true
   
-  deployment_frequency:
-    low: "Weekly or less"
-    medium: "Daily"
-    high: "Multiple times per day"
-  
-  technology_diversity:
-    homogeneous: "Single language/framework"
-    mixed: "2-3 languages/frameworks"
-    diverse: "> 3 languages/frameworks"
+  deployment_model:
+    independent_services: true
+    shared_infrastructure: true
+    environment_promotion: true
+    rollback_capability: true
 ```
 
 ## Error Handling
@@ -284,54 +284,37 @@ decision_factors:
 - **Security Boundaries**: RBAC and security context testing
 - **Compliance Testing**: Regulatory and organizational policy validation
 
-## Repository Strategy Analysis
+## Monorepo Implementation Strategy
 
-### Monorepo Advantages
-- **Unified Versioning**: Single source of truth for all components
-- **Simplified Dependencies**: Easier cross-service dependency management
-- **Atomic Changes**: Cross-service changes in single commits
-- **Shared Tooling**: Consistent build and deployment tools
-- **Code Reuse**: Easier sharing of common libraries and utilities
+### Core Benefits
+- **Unified Versioning**: Single source of truth for all components with atomic releases
+- **Simplified Dependencies**: Easier cross-service dependency management and updates
+- **Atomic Changes**: Cross-service changes in single commits with coordinated deployments
+- **Shared Tooling**: Consistent build, test, and deployment tools across all services
+- **Code Reuse**: Centralized shared libraries and utilities with version consistency
 
-### Monorepo Disadvantages
-- **Build Complexity**: Longer build times as codebase grows
-- **Access Control**: Difficult to restrict access to specific components
-- **Scaling Issues**: Git performance degrades with repository size
-- **Team Autonomy**: Reduced team independence and ownership
-- **Technology Constraints**: Harder to use different tech stacks
+### Implementation Approach
 
-### Multi-repo Advantages
-- **Team Autonomy**: Independent development and deployment cycles
-- **Technology Flexibility**: Different tech stacks per service
-- **Access Control**: Granular repository-level permissions
-- **Build Performance**: Faster, focused builds per repository
-- **Fault Isolation**: Issues in one repo don't affect others
+#### Selective Build System
+- **Change Detection**: Git-based detection of modified services and dependencies
+- **Build Optimization**: Only build affected services and their dependents
+- **Caching Strategy**: Aggressive caching of unchanged components and dependencies
+- **Parallel Execution**: Independent services build concurrently when possible
 
-### Multi-repo Disadvantages
-- **Dependency Management**: Complex cross-repository dependencies
-- **Versioning Complexity**: Coordinating versions across repositories
-- **Tooling Overhead**: Duplicated CI/CD configurations
-- **Code Duplication**: Harder to share common code and libraries
-- **Integration Testing**: Complex cross-service testing scenarios
+#### Dependency Management
+- **Shared Libraries**: Centralized common code with semantic versioning
+- **Configuration Management**: Shared configurations with service-specific overrides
+- **Tool Standardization**: Consistent linting, testing, and build tools
+- **Version Synchronization**: Coordinated updates across all services
 
-### Decision Framework
+#### Team Collaboration
+- **Code Ownership**: Clear ownership boundaries using CODEOWNERS files
+- **Branch Strategy**: Feature branches with service-specific prefixes
+- **Review Process**: Automated routing to appropriate teams based on changed files
+- **Integration Testing**: Comprehensive cross-service testing in CI/CD pipeline
 
-#### Choose Monorepo When:
-- Team size < 50 developers
-- Tightly coupled services with frequent cross-service changes
-- Homogeneous technology stack
-- Strong emphasis on code sharing and consistency
-- Centralized DevOps team managing all deployments
-
-#### Choose Multi-repo When:
-- Team size > 50 developers with multiple autonomous teams
-- Loosely coupled services with independent release cycles
-- Diverse technology stacks across services
-- Strong team ownership and autonomy requirements
-- Distributed DevOps responsibilities
-
-#### Hybrid Approach:
-- **Service Groups**: Related services in shared repositories
-- **Platform Components**: Shared infrastructure in separate repositories
-- **Application Boundaries**: Business domain-driven repository boundaries
-- **Gradual Migration**: Start with monorepo, split as teams grow
+### Scaling Considerations
+- **Build Performance**: Implement incremental builds and distributed caching
+- **Repository Size**: Use Git LFS for large assets and regular cleanup
+- **Access Control**: Branch protection rules and path-based permissions
+- **Team Autonomy**: Service-specific deployment pipelines within unified CI/CD

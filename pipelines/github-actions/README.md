@@ -1,6 +1,6 @@
 # GitHub Actions Pipeline Implementation
 
-This directory contains comprehensive GitHub Actions workflows for building, testing, and deploying Kubernetes applications. The implementation supports both monorepo and multi-repo strategies with production-ready features.
+This directory contains comprehensive GitHub Actions workflows for building, testing, and deploying Kubernetes applications using a monorepo strategy with production-ready features.
 
 ## Features
 
@@ -17,17 +17,18 @@ This directory contains comprehensive GitHub Actions workflows for building, tes
 - **Secret detection**: Automated secret scanning and prevention
 - **OIDC authentication**: Secure registry access without long-lived tokens
 
-### Repository Strategy Support
-- **Monorepo workflows**: Optimized for monolithic repositories with change detection
-- **Multi-repo workflows**: Individual service pipelines with cross-service coordination
+### Monorepo Strategy Support
+- **Change detection**: Only builds services that have changed
+- **Selective builds**: Optimized builds for modified components
 - **Reusable workflows**: Shared workflow components to reduce duplication
+- **Cross-service coordination**: Integrated testing and deployment
 
 ## Workflow Structure
 
 ### Monorepo Implementation
 
 ```
-examples/monorepo/.github/workflows/
+.github/workflows/
 ├── build-and-test.yml          # Main build and test workflow
 ├── reusable-build-test.yml     # Reusable workflow for individual services
 ├── security-scan.yml           # Security scanning workflow
@@ -40,22 +41,8 @@ examples/monorepo/.github/workflows/
 - **Parallel Execution**: Builds multiple services simultaneously
 - **Shared Dependencies**: Optimized caching for shared libraries
 - **Integration Testing**: Cross-service integration tests
-
-### Multi-repo Implementation
-
-```
-examples/multi-repo/{service}/.github/workflows/
-├── build-and-test.yml          # Service-specific build and test
-├── security-scan.yml           # Security scanning
-├── container-build.yml         # Container build and push
-└── deploy.yml                  # Deployment workflow
-```
-
-#### Key Features:
-- **Service Autonomy**: Independent build and deployment cycles
-- **Focused Testing**: Service-specific test suites
-- **Performance Testing**: Service-level performance validation
-- **Isolated Security**: Per-service security scanning
+- **Unified Versioning**: All services versioned together
+- **Atomic Deployments**: Coordinated cross-service deployments
 
 ## Workflow Configuration
 
@@ -67,6 +54,14 @@ env:
   REGISTRY: ghcr.io              # Container registry
   IMAGE_NAME: ${{ github.repository }}
 ```
+
+### Self-Hosted Runner Configuration
+
+All workflows are configured to run on self-hosted runners with:
+- Direct access to the `dev` Kubernetes cluster
+- Pre-installed tooling (kubectl, Docker, Node.js)
+- Enhanced performance and security
+- Custom configurations for the development environment
 
 ### Build Matrix
 
@@ -119,14 +114,13 @@ strategy:
     sarif_file: 'trivy-results.sarif'
 ```
 
-### OIDC Authentication
+### Kubernetes Access
 
 ```yaml
-- name: Configure AWS credentials
-  uses: aws-actions/configure-aws-credentials@v4
-  with:
-    role-to-assume: arn:aws:iam::ACCOUNT:role/GitHubActions
-    aws-region: us-east-1
+- name: Setup kubectl context
+  run: |
+    # Use the pre-configured dev cluster context on self-hosted runner
+    kubectl config use-context dev
 ```
 
 ### Secret Management
@@ -165,18 +159,24 @@ strategy:
 ## Deployment Integration
 
 ### Environment Strategy
-- **Development**: Automatic deployment on main branch
-- **Staging**: Deployment with approval gates
-- **Production**: Manual approval with rollback capabilities
+- **Development**: Automatic deployment to `dev` cluster on main branch
+- **Staging**: Deployment to `dev` cluster with staging namespace
+- **Production**: Manual approval with rollback capabilities (uses `dev` cluster for demo)
+
+### Self-Hosted Runner Benefits
+- Direct cluster access without cloud authentication
+- Faster builds with local caching
+- Custom tooling and configurations
+- Enhanced security for sensitive operations
 
 ### GitOps Integration
-- ArgoCD application updates
-- Flux synchronization triggers
+- Direct kubectl deployments to dev cluster
 - Kubernetes manifest validation
+- Real-time deployment monitoring
 
 ## Usage Examples
 
-### Monorepo Workflow Trigger
+### Workflow Trigger Configuration
 
 ```yaml
 on:
@@ -185,16 +185,6 @@ on:
     paths:
       - 'applications/**'
       - 'shared/**'
-  pull_request:
-    branches: [ main, develop ]
-```
-
-### Multi-repo Workflow Trigger
-
-```yaml
-on:
-  push:
-    branches: [ main, develop ]
   pull_request:
     branches: [ main, develop ]
   workflow_dispatch:
@@ -292,4 +282,4 @@ When adding new workflows:
 2. Include comprehensive error handling
 3. Add appropriate caching strategies
 4. Document any new environment variables
-5. Test with both monorepo and multi-repo structures
+5. Test with the monorepo structure and ensure proper change detection

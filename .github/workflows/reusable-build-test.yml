@@ -28,7 +28,7 @@ env:
 
 jobs:
   build-and-test:
-    runs-on: ubuntu-latest
+    runs-on: self-hosted
     outputs:
       image-digest: ${{ steps.build.outputs.digest }}
     strategy:
@@ -132,7 +132,7 @@ jobs:
   integration-tests:
     if: inputs.run-integration-tests
     needs: build-and-test
-    runs-on: ubuntu-latest
+    runs-on: self-hosted
     
     steps:
       - name: Checkout code
