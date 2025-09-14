@@ -1,0 +1,465 @@
+name: Deploy to Environments
+
+on:
+  workflow_run:
+    workflows: ["Container Build and Push"]
+    types:
+      - completed
+    branches: [main, develop]
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Environment to deploy to'
+        required: true
+        default: 'development'
+        type: choice
+        options:
+          - development
+          - staging
+          - production
+      service:
+        description: 'Service to deploy (leave empty for all changed services)'
+        required: false
+        type: string
+      version:
+        description: 'Version to deploy (leave empty for latest)'
+        required: false
+        type: string
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
+
+permissions:
+  contents: read
+  packages: read
+  deployments: write
+  id-token: write
+
+jobs:
+  determine-deployment:
+    runs-on: ubuntu-latest
+    outputs:
+      environment: ${{ steps.env.outputs.environment }}
+      services: ${{ steps.services.outputs.services }}
+      version: ${{ steps.version.outputs.version }}
+      should-deploy: ${{ steps.check.outputs.should-deploy }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Determine environment
+        id: env
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            ENVIRONMENT="${{ github.event.inputs.environment }}"
+          elif [ "${{ github.ref }}" = "refs/heads/main" ]; then
+            ENVIRONMENT="development"
+          elif [ "${{ github.ref }}" = "refs/heads/develop" ]; then
+            ENVIRONMENT="development"
+          else
+            ENVIRONMENT="review"
+          fi
+          
+          echo "environment=$ENVIRONMENT" >> $GITHUB_OUTPUT
+          echo "Determined environment: $ENVIRONMENT"
+
+      - name: Determine services to deploy
+        id: services
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ] && [ -n "${{ github.event.inputs.service }}" ]; then
+            SERVICES='["${{ github.event.inputs.service }}"]'
+          else
+            # Check which services were built in the triggering workflow
+            SERVICES='["web-app", "api-service"]'
+          fi
+          
+          echo "services=$SERVICES" >> $GITHUB_OUTPUT
+          echo "Services to deploy: $SERVICES"
+
+      - name: Determine version
+        id: version
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ] && [ -n "${{ github.event.inputs.version }}" ]; then
+            VERSION="${{ github.event.inputs.version }}"
+          else
+            VERSION="$(date +%Y%m%d)-${GITHUB_SHA::8}"
+          fi
+          
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+          echo "Version to deploy: $VERSION"
+
+      - name: Check if should deploy
+        id: check
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "should-deploy=true" >> $GITHUB_OUTPUT
+          elif [ "${{ github.event.workflow_run.conclusion }}" = "success" ]; then
+            echo "should-deploy=true" >> $GITHUB_OUTPUT
+          else
+            echo "should-deploy=false" >> $GITHUB_OUTPUT
+          fi
+
+  deploy-development:
+    needs: determine-deployment
+    if: needs.determine-deployment.outputs.should-deploy == 'true' && needs.determine-deployment.outputs.environment == 'development'
+    runs-on: ubuntu-latest
+    environment: 
+      name: development
+      url: https://dev.example.com
+    strategy:
+      matrix:
+        service: ${{ fromJson(needs.determine-deployment.outputs.services) }}
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup kubectl
+        uses: azure/setup-kubectl@v3
+        with:
+          version: 'v1.28.0'
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_DEV }}
+          aws-region: us-east-1
+
+      - name: Update kubeconfig
+        run: |
+          aws eks update-kubeconfig --region us-east-1 --name dev-cluster
+
+      - name: Create namespace if not exists
+        run: |
+          kubectl create namespace development --dry-run=client -o yaml | kubectl apply -f -
+
+      - name: Deploy to development
+        run: |
+          # Update deployment manifest with new image
+          IMAGE="${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}/${{ matrix.service }}:${{ needs.determine-deployment.outputs.version }}"
+          
+          # Create deployment from template
+          envsubst < manifests/deployments/${{ matrix.service }}-deployment.yaml | \
+          sed "s|image: .*|image: $IMAGE|g" | \
+          kubectl apply -f - -n development
+          
+          # Apply service if exists
+          if [ -f "manifests/services/${{ matrix.service }}-service.yaml" ]; then
+            kubectl apply -f manifests/services/${{ matrix.service }}-service.yaml -n development
+          fi
+
+      - name: Wait for deployment
+        run: |
+          kubectl rollout status deployment/${{ matrix.service }} -n development --timeout=300s
+
+      - name: Run smoke tests
+        run: |
+          # Get service endpoint
+          SERVICE_IP=$(kubectl get service ${{ matrix.service }} -n development -o jsonpath='{.status.loadBalancer.ingress[0].ip}' || echo "localhost")
+          
+          # Wait for service to be ready
+          timeout 60 bash -c "until curl -f http://$SERVICE_IP/health 2>/dev/null; do sleep 5; done" || echo "Health check timeout"
+          
+          # Run basic smoke tests
+          echo "Running smoke tests for ${{ matrix.service }}"
+          curl -f "http://$SERVICE_IP/health" || exit 1
+
+      - name: Update deployment status
+        if: always()
+        run: |
+          if [ "${{ job.status }}" = "success" ]; then
+            echo "✅ ${{ matrix.service }} deployed successfully to development"
+          else
+            echo "❌ ${{ matrix.service }} deployment to development failed"
+            exit 1
+          fi
+
+  deploy-staging:
+    needs: [determine-deployment, deploy-development]
+    if: needs.determine-deployment.outputs.should-deploy == 'true' && (needs.determine-deployment.outputs.environment == 'staging' || (needs.determine-deployment.outputs.environment == 'development' && github.ref == 'refs/heads/main'))
+    runs-on: ubuntu-latest
+    environment: 
+      name: staging
+      url: https://staging.example.com
+    strategy:
+      matrix:
+        service: ${{ fromJson(needs.determine-deployment.outputs.services) }}
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup kubectl
+        uses: azure/setup-kubectl@v3
+        with:
+          version: 'v1.28.0'
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_STAGING }}
+          aws-region: us-east-1
+
+      - name: Update kubeconfig
+        run: |
+          aws eks update-kubeconfig --region us-east-1 --name staging-cluster
+
+      - name: Create namespace if not exists
+        run: |
+          kubectl create namespace staging --dry-run=client -o yaml | kubectl apply -f -
+
+      - name: Deploy to staging
+        run: |
+          # Update deployment manifest with new image
+          IMAGE="${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}/${{ matrix.service }}:${{ needs.determine-deployment.outputs.version }}"
+          
+          # Create deployment from template
+          envsubst < manifests/deployments/${{ matrix.service }}-deployment.yaml | \
+          sed "s|image: .*|image: $IMAGE|g" | \
+          sed "s|replicas: 1|replicas: 2|g" | \
+          kubectl apply -f - -n staging
+          
+          # Apply service
+          if [ -f "manifests/services/${{ matrix.service }}-service.yaml" ]; then
+            kubectl apply -f manifests/services/${{ matrix.service }}-service.yaml -n staging
+          fi
+          
+          # Apply ingress for staging
+          if [ -f "manifests/ingress/staging-ingress.yaml" ]; then
+            kubectl apply -f manifests/ingress/staging-ingress.yaml -n staging
+          fi
+
+      - name: Wait for deployment
+        run: |
+          kubectl rollout status deployment/${{ matrix.service }} -n staging --timeout=600s
+
+      - name: Run integration tests
+        run: |
+          # Get ingress endpoint
+          INGRESS_IP=$(kubectl get ingress -n staging -o jsonpath='{.items[0].status.loadBalancer.ingress[0].ip}' || echo "staging.example.com")
+          
+          # Wait for service to be ready
+          timeout 120 bash -c "until curl -f http://$INGRESS_IP/health 2>/dev/null; do sleep 10; done" || echo "Health check timeout"
+          
+          # Run integration tests
+          echo "Running integration tests for ${{ matrix.service }}"
+          
+          # Test health endpoint
+          curl -f "http://$INGRESS_IP/health" || exit 1
+          
+          # Test service endpoints
+          if [ "${{ matrix.service }}" = "api-service" ]; then
+            curl -f "http://$INGRESS_IP/api/status" || exit 1
+          fi
+          
+          # Load test
+          if command -v ab >/dev/null 2>&1; then
+            ab -n 100 -c 5 "http://$INGRESS_IP/health"
+          fi
+
+      - name: Update deployment status
+        if: always()
+        run: |
+          if [ "${{ job.status }}" = "success" ]; then
+            echo "✅ ${{ matrix.service }} deployed successfully to staging"
+          else
+            echo "❌ ${{ matrix.service }} deployment to staging failed"
+            exit 1
+          fi
+
+  deploy-production:
+    needs: [determine-deployment, deploy-staging]
+    if: needs.determine-deployment.outputs.should-deploy == 'true' && needs.determine-deployment.outputs.environment == 'production'
+    runs-on: ubuntu-latest
+    environment: 
+      name: production
+      url: https://example.com
+    strategy:
+      matrix:
+        service: ${{ fromJson(needs.determine-deployment.outputs.services) }}
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup kubectl
+        uses: azure/setup-kubectl@v3
+        with:
+          version: 'v1.28.0'
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_PROD }}
+          aws-region: us-east-1
+
+      - name: Update kubeconfig
+        run: |
+          aws eks update-kubeconfig --region us-east-1 --name prod-cluster
+
+      - name: Backup current deployment
+        run: |
+          # Create backup of current deployment
+          kubectl get deployment ${{ matrix.service }} -n production -o yaml > backup-${{ matrix.service }}-$(date +%Y%m%d-%H%M%S).yaml || echo "No existing deployment to backup"
+
+      - name: Deploy to production with rolling update
+        run: |
+          # Update deployment manifest with new image
+          IMAGE="${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}/${{ matrix.service }}:${{ needs.determine-deployment.outputs.version }}"
+          
+          # Create production deployment with higher replica count and resource limits
+          envsubst < manifests/deployments/${{ matrix.service }}-deployment.yaml | \
+          sed "s|image: .*|image: $IMAGE|g" | \
+          sed "s|replicas: 1|replicas: 3|g" | \
+          sed "s|memory: \"128Mi\"|memory: \"256Mi\"|g" | \
+          sed "s|cpu: \"100m\"|cpu: \"200m\"|g" | \
+          kubectl apply -f - -n production
+          
+          # Apply service
+          if [ -f "manifests/services/${{ matrix.service }}-service.yaml" ]; then
+            kubectl apply -f manifests/services/${{ matrix.service }}-service.yaml -n production
+          fi
+          
+          # Apply production ingress
+          if [ -f "manifests/ingress/prod-ingress.yaml" ]; then
+            kubectl apply -f manifests/ingress/prod-ingress.yaml -n production
+          fi
+
+      - name: Wait for deployment with health checks
+        run: |
+          # Wait for rollout to complete
+          kubectl rollout status deployment/${{ matrix.service }} -n production --timeout=900s
+          
+          # Additional health checks
+          sleep 30
+          
+          # Verify all pods are ready
+          kubectl wait --for=condition=ready pod -l app=${{ matrix.service }} -n production --timeout=300s
+
+      - name: Run production validation tests
+        run: |
+          # Get production endpoint
+          PROD_ENDPOINT=$(kubectl get ingress -n production -o jsonpath='{.items[0].spec.rules[0].host}' || echo "example.com")
+          
+          # Wait for service to be fully ready
+          timeout 180 bash -c "until curl -f https://$PROD_ENDPOINT/health 2>/dev/null; do sleep 15; done" || echo "Health check timeout"
+          
+          # Run production validation tests
+          echo "Running production validation tests for ${{ matrix.service }}"
+          
+          # Test health endpoint
+          curl -f "https://$PROD_ENDPOINT/health" || exit 1
+          
+          # Test service endpoints
+          if [ "${{ matrix.service }}" = "api-service" ]; then
+            curl -f "https://$PROD_ENDPOINT/api/status" || exit 1
+          fi
+          
+          # Performance validation
+          if command -v ab >/dev/null 2>&1; then
+            ab -n 50 -c 2 "https://$PROD_ENDPOINT/health"
+          fi
+
+      - name: Monitor deployment
+        run: |
+          # Monitor for 5 minutes after deployment
+          echo "Monitoring deployment for 5 minutes..."
+          
+          for i in {1..10}; do
+            # Check pod status
+            READY_PODS=$(kubectl get pods -l app=${{ matrix.service }} -n production -o jsonpath='{.items[?(@.status.phase=="Running")].metadata.name}' | wc -w)
+            TOTAL_PODS=$(kubectl get pods -l app=${{ matrix.service }} -n production --no-headers | wc -l)
+            
+            echo "Ready pods: $READY_PODS/$TOTAL_PODS"
+            
+            # Check for any errors
+            ERROR_PODS=$(kubectl get pods -l app=${{ matrix.service }} -n production -o jsonpath='{.items[?(@.status.phase!="Running")].metadata.name}')
+            if [ -n "$ERROR_PODS" ]; then
+              echo "Error pods detected: $ERROR_PODS"
+              kubectl describe pods $ERROR_PODS -n production
+            fi
+            
+            sleep 30
+          done
+
+      - name: Update deployment status
+        if: always()
+        run: |
+          if [ "${{ job.status }}" = "success" ]; then
+            echo "✅ ${{ matrix.service }} deployed successfully to production"
+            
+            # Send success notification
+            curl -X POST "${{ secrets.SLACK_WEBHOOK_URL }}" \
+              -H 'Content-type: application/json' \
+              --data '{
+                "text": "🚀 Production Deployment Successful",
+                "attachments": [{
+                  "color": "good",
+                  "fields": [{
+                    "title": "Service",
+                    "value": "${{ matrix.service }}",
+                    "short": true
+                  }, {
+                    "title": "Version",
+                    "value": "${{ needs.determine-deployment.outputs.version }}",
+                    "short": true
+                  }]
+                }]
+              }' || echo "Notification failed"
+          else
+            echo "❌ ${{ matrix.service }} deployment to production failed"
+            
+            # Send failure notification
+            curl -X POST "${{ secrets.SLACK_WEBHOOK_URL }}" \
+              -H 'Content-type: application/json' \
+              --data '{
+                "text": "🚨 Production Deployment Failed",
+                "attachments": [{
+                  "color": "danger",
+                  "fields": [{
+                    "title": "Service",
+                    "value": "${{ matrix.service }}",
+                    "short": true
+                  }, {
+                    "title": "Version",
+                    "value": "${{ needs.determine-deployment.outputs.version }}",
+                    "short": true
+                  }]
+                }]
+              }' || echo "Notification failed"
+            
+            exit 1
+          fi
+
+  deployment-summary:
+    needs: [determine-deployment, deploy-development, deploy-staging, deploy-production]
+    if: always()
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Deployment Summary
+        run: |
+          echo "## Deployment Summary" >> $GITHUB_STEP_SUMMARY
+          echo "| Environment | Services | Version | Status |" >> $GITHUB_STEP_SUMMARY
+          echo "|-------------|----------|---------|--------|" >> $GITHUB_STEP_SUMMARY
+          
+          ENVIRONMENT="${{ needs.determine-deployment.outputs.environment }}"
+          VERSION="${{ needs.determine-deployment.outputs.version }}"
+          SERVICES="${{ needs.determine-deployment.outputs.services }}"
+          
+          if [ "$ENVIRONMENT" = "development" ] || [ "$ENVIRONMENT" = "staging" ] || [ "$ENVIRONMENT" = "production" ]; then
+            if [ "$ENVIRONMENT" = "development" ]; then
+              STATUS="${{ needs.deploy-development.result }}"
+            elif [ "$ENVIRONMENT" = "staging" ]; then
+              STATUS="${{ needs.deploy-staging.result }}"
+            else
+              STATUS="${{ needs.deploy-production.result }}"
+            fi
+            
+            echo "| $ENVIRONMENT | $SERVICES | $VERSION | $STATUS |" >> $GITHUB_STEP_SUMMARY
+          fi
+          
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Deployment triggered by:** ${{ github.event_name }}" >> $GITHUB_STEP_SUMMARY
+          echo "**Commit:** ${{ github.sha }}" >> $GITHUB_STEP_SUMMARY

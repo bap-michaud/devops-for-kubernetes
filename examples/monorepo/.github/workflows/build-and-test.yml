@@ -1,0 +1,196 @@
+name: Build and Test
+
+on:
+  push:
+    branches: [ main, develop ]
+  pull_request:
+    branches: [ main, develop ]
+  workflow_dispatch:
+
+env:
+  NODE_VERSION: '18'
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
+
+jobs:
+  detect-changes:
+    runs-on: ubuntu-latest
+    outputs:
+      web-app: ${{ steps.changes.outputs.web-app }}
+      api-service: ${{ steps.changes.outputs.api-service }}
+      shared: ${{ steps.changes.outputs.shared }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Detect changes
+        uses: dorny/paths-filter@v2
+        id: changes
+        with:
+          filters: |
+            web-app:
+              - 'applications/web-app/**'
+              - 'shared/**'
+            api-service:
+              - 'applications/api-service/**'
+              - 'shared/**'
+            shared:
+              - 'shared/**'
+
+  build-and-test:
+    needs: detect-changes
+    if: needs.detect-changes.outputs.web-app == 'true' || needs.detect-changes.outputs.api-service == 'true'
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        service: 
+          - ${{ needs.detect-changes.outputs.web-app == 'true' && 'web-app' || '' }}
+          - ${{ needs.detect-changes.outputs.api-service == 'true' && 'api-service' || '' }}
+        architecture: [amd64, arm64]
+        exclude:
+          - service: ''
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: 'npm'
+          cache-dependency-path: 'applications/${{ matrix.service }}/package-lock.json'
+
+      - name: Cache dependencies
+        uses: actions/cache@v3
+        with:
+          path: |
+            ~/.npm
+            applications/${{ matrix.service }}/node_modules
+          key: ${{ runner.os }}-node-${{ env.NODE_VERSION }}-${{ matrix.service }}-${{ hashFiles('applications/${{ matrix.service }}/package-lock.json') }}
+          restore-keys: |
+            ${{ runner.os }}-node-${{ env.NODE_VERSION }}-${{ matrix.service }}-
+            ${{ runner.os }}-node-${{ env.NODE_VERSION }}-
+
+      - name: Install dependencies
+        working-directory: applications/${{ matrix.service }}
+        run: npm ci
+
+      - name: Run linting
+        working-directory: applications/${{ matrix.service }}
+        run: |
+          if [ -f "package.json" ] && grep -q '"lint"' package.json; then
+            npm run lint
+          else
+            echo "No linting script found, skipping..."
+          fi
+
+      - name: Run tests
+        working-directory: applications/${{ matrix.service }}
+        run: npm run test:coverage
+
+      - name: Upload test results
+        uses: actions/upload-artifact@v3
+        if: always()
+        with:
+          name: test-results-${{ matrix.service }}-${{ matrix.architecture }}
+          path: |
+            applications/${{ matrix.service }}/coverage/
+            applications/${{ matrix.service }}/test-results.xml
+          retention-days: 30
+
+      - name: Upload coverage to Codecov
+        uses: codecov/codecov-action@v3
+        with:
+          file: applications/${{ matrix.service }}/coverage/lcov.info
+          flags: ${{ matrix.service }}
+          name: ${{ matrix.service }}-coverage
+          fail_ci_if_error: false
+
+  integration-tests:
+    needs: [detect-changes, build-and-test]
+    if: needs.detect-changes.outputs.web-app == 'true' && needs.detect-changes.outputs.api-service == 'true'
+    runs-on: ubuntu-latest
+    
+    services:
+      postgres:
+        image: postgres:15
+        env:
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: testdb
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+        ports:
+          - 5432:5432
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+
+      - name: Install dependencies for all services
+        run: |
+          for service in web-app api-service; do
+            cd applications/$service
+            npm ci
+            cd ../..
+          done
+
+      - name: Start services for integration testing
+        run: |
+          # Start API service in background
+          cd applications/api-service
+          npm start &
+          API_PID=$!
+          cd ../..
+          
+          # Wait for API to be ready
+          timeout 30 bash -c 'until curl -f http://localhost:3001/health; do sleep 1; done'
+          
+          # Start web app in background
+          cd applications/web-app
+          npm start &
+          WEB_PID=$!
+          cd ../..
+          
+          # Wait for web app to be ready
+          timeout 30 bash -c 'until curl -f http://localhost:3000/health; do sleep 1; done'
+          
+          # Run integration tests
+          echo "Running integration tests..."
+          # Add your integration test commands here
+          
+          # Cleanup
+          kill $API_PID $WEB_PID || true
+
+  build-summary:
+    needs: [detect-changes, build-and-test, integration-tests]
+    if: always()
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Build Summary
+        run: |
+          echo "## Build Summary" >> $GITHUB_STEP_SUMMARY
+          echo "| Service | Status | Architecture |" >> $GITHUB_STEP_SUMMARY
+          echo "|---------|--------|--------------|" >> $GITHUB_STEP_SUMMARY
+          
+          if [ "${{ needs.detect-changes.outputs.web-app }}" == "true" ]; then
+            echo "| web-app | ${{ needs.build-and-test.result }} | amd64, arm64 |" >> $GITHUB_STEP_SUMMARY
+          fi
+          
+          if [ "${{ needs.detect-changes.outputs.api-service }}" == "true" ]; then
+            echo "| api-service | ${{ needs.build-and-test.result }} | amd64, arm64 |" >> $GITHUB_STEP_SUMMARY
+          fi
+          
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "Integration Tests: ${{ needs.integration-tests.result }}" >> $GITHUB_STEP_SUMMARY

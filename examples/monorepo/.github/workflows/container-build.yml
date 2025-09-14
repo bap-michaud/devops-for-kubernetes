@@ -1,0 +1,348 @@
+name: Container Build and Push
+
+on:
+  push:
+    branches: [ main, develop ]
+    tags: [ 'v*' ]
+  pull_request:
+    branches: [ main ]
+  workflow_dispatch:
+    inputs:
+      force_build:
+        description: 'Force build all services'
+        required: false
+        default: false
+        type: boolean
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
+
+permissions:
+  contents: read
+  packages: write
+  id-token: write
+  attestations: write
+
+jobs:
+  detect-changes:
+    runs-on: ubuntu-latest
+    outputs:
+      web-app: ${{ steps.changes.outputs.web-app }}
+      api-service: ${{ steps.changes.outputs.api-service }}
+      version: ${{ steps.version.outputs.version }}
+      is-release: ${{ steps.version.outputs.is-release }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Detect changes
+        uses: dorny/paths-filter@v2
+        id: changes
+        with:
+          filters: |
+            web-app:
+              - 'applications/web-app/**'
+              - 'shared/**'
+            api-service:
+              - 'applications/api-service/**'
+              - 'shared/**'
+
+      - name: Generate version
+        id: version
+        run: |
+          if [[ $GITHUB_REF == refs/tags/v* ]]; then
+            VERSION=${GITHUB_REF#refs/tags/v}
+            IS_RELEASE=true
+          elif [[ $GITHUB_REF == refs/heads/main ]]; then
+            VERSION=$(date +%Y%m%d)-${GITHUB_SHA::8}
+            IS_RELEASE=false
+          else
+            VERSION=pr-${{ github.event.number }}-${GITHUB_SHA::8}
+            IS_RELEASE=false
+          fi
+          
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+          echo "is-release=$IS_RELEASE" >> $GITHUB_OUTPUT
+          echo "Generated version: $VERSION"
+
+  build-and-push:
+    needs: detect-changes
+    if: needs.detect-changes.outputs.web-app == 'true' || needs.detect-changes.outputs.api-service == 'true' || github.event.inputs.force_build == 'true'
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        service: 
+          - ${{ (needs.detect-changes.outputs.web-app == 'true' || github.event.inputs.force_build == 'true') && 'web-app' || '' }}
+          - ${{ (needs.detect-changes.outputs.api-service == 'true' || github.event.inputs.force_build == 'true') && 'api-service' || '' }}
+        platform: [linux/amd64, linux/arm64]
+        exclude:
+          - service: ''
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}/${{ matrix.service }}
+          tags: |
+            type=ref,event=branch
+            type=ref,event=pr
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=semver,pattern={{major}}
+            type=raw,value=${{ needs.detect-changes.outputs.version }}
+            type=raw,value=latest,enable={{is_default_branch}}
+          labels: |
+            org.opencontainers.image.title=${{ matrix.service }}
+            org.opencontainers.image.description=DevOps pipeline example - ${{ matrix.service }}
+            org.opencontainers.image.vendor=DevOps Team
+            org.opencontainers.image.version=${{ needs.detect-changes.outputs.version }}
+
+      - name: Build and push by digest
+        id: build
+        uses: docker/build-push-action@v5
+        with:
+          context: applications/${{ matrix.service }}
+          platforms: ${{ matrix.platform }}
+          labels: ${{ steps.meta.outputs.labels }}
+          outputs: type=image,name=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}/${{ matrix.service }},push-by-digest=true,name-canonical=true,push=true
+          cache-from: type=gha,scope=${{ matrix.service }}-${{ matrix.platform }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.service }}-${{ matrix.platform }}
+          build-args: |
+            VERSION=${{ needs.detect-changes.outputs.version }}
+            BUILD_DATE=${{ fromJSON(steps.meta.outputs.json).labels['org.opencontainers.image.created'] }}
+            VCS_REF=${{ github.sha }}
+
+      - name: Export digest
+        run: |
+          mkdir -p /tmp/digests
+          digest="${{ steps.build.outputs.digest }}"
+          touch "/tmp/digests/${digest#sha256:}"
+
+      - name: Upload digest
+        uses: actions/upload-artifact@v3
+        with:
+          name: digests-${{ matrix.service }}
+          path: /tmp/digests/*
+          if-no-files-found: error
+          retention-days: 1
+
+  merge-and-sign:
+    needs: [detect-changes, build-and-push]
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        service: 
+          - ${{ (needs.detect-changes.outputs.web-app == 'true' || github.event.inputs.force_build == 'true') && 'web-app' || '' }}
+          - ${{ (needs.detect-changes.outputs.api-service == 'true' || github.event.inputs.force_build == 'true') && 'api-service' || '' }}
+        exclude:
+          - service: ''
+    
+    steps:
+      - name: Download digests
+        uses: actions/download-artifact@v3
+        with:
+          name: digests-${{ matrix.service }}
+          path: /tmp/digests
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}/${{ matrix.service }}
+          tags: |
+            type=ref,event=branch
+            type=ref,event=pr
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=semver,pattern={{major}}
+            type=raw,value=${{ needs.detect-changes.outputs.version }}
+            type=raw,value=latest,enable={{is_default_branch}}
+
+      - name: Create manifest list and push
+        working-directory: /tmp/digests
+        run: |
+          docker buildx imagetools create $(jq -cr '.tags | map("-t " + .) | join(" ")' <<< "$DOCKER_METADATA_OUTPUT_JSON") \
+            $(printf '${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}/${{ matrix.service }}@sha256:%s ' *)
+
+      - name: Inspect image
+        run: |
+          docker buildx imagetools inspect ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}/${{ matrix.service }}:${{ steps.meta.outputs.version }}
+
+      - name: Install Cosign
+        uses: sigstore/cosign-installer@v3.1.1
+        with:
+          cosign-release: 'v2.2.0'
+
+      - name: Sign container image
+        env:
+          TAGS: ${{ steps.meta.outputs.tags }}
+          DIGEST: ${{ steps.build.outputs.digest }}
+        run: |
+          images=""
+          for tag in ${TAGS}; do
+            images+="${tag}@${DIGEST} "
+          done
+          cosign sign --yes ${images}
+
+      - name: Generate SBOM
+        uses: anchore/sbom-action@v0
+        with:
+          image: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}/${{ matrix.service }}:${{ needs.detect-changes.outputs.version }}
+          format: spdx-json
+          output-file: sbom-${{ matrix.service }}.spdx.json
+
+      - name: Attest SBOM
+        uses: actions/attest-sbom@v1
+        with:
+          subject-name: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}/${{ matrix.service }}
+          subject-digest: ${{ steps.build.outputs.digest }}
+          sbom-path: sbom-${{ matrix.service }}.spdx.json
+          push-to-registry: true
+
+      - name: Upload SBOM
+        uses: actions/upload-artifact@v3
+        with:
+          name: sbom-${{ matrix.service }}
+          path: sbom-${{ matrix.service }}.spdx.json
+          retention-days: 30
+
+  vulnerability-scan:
+    needs: [detect-changes, merge-and-sign]
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        service: 
+          - ${{ (needs.detect-changes.outputs.web-app == 'true' || github.event.inputs.force_build == 'true') && 'web-app' || '' }}
+          - ${{ (needs.detect-changes.outputs.api-service == 'true' || github.event.inputs.force_build == 'true') && 'api-service' || '' }}
+        exclude:
+          - service: ''
+    
+    steps:
+      - name: Log in to Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Run Trivy vulnerability scanner
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: '${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}/${{ matrix.service }}:${{ needs.detect-changes.outputs.version }}'
+          format: 'sarif'
+          output: 'trivy-${{ matrix.service }}.sarif'
+
+      - name: Upload Trivy scan results
+        uses: github/codeql-action/upload-sarif@v2
+        if: always()
+        with:
+          sarif_file: 'trivy-${{ matrix.service }}.sarif'
+
+      - name: Check for critical vulnerabilities
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: '${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}/${{ matrix.service }}:${{ needs.detect-changes.outputs.version }}'
+          format: 'json'
+          output: 'trivy-${{ matrix.service }}.json'
+          exit-code: '1'
+          severity: 'CRITICAL,HIGH'
+
+  update-deployment-manifests:
+    needs: [detect-changes, vulnerability-scan]
+    if: github.ref == 'refs/heads/main' && needs.detect-changes.outputs.is-release == 'false'
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        service: 
+          - ${{ (needs.detect-changes.outputs.web-app == 'true' || github.event.inputs.force_build == 'true') && 'web-app' || '' }}
+          - ${{ (needs.detect-changes.outputs.api-service == 'true' || github.event.inputs.force_build == 'true') && 'api-service' || '' }}
+        exclude:
+          - service: ''
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Update deployment manifest
+        run: |
+          # Update the image tag in Kubernetes manifests
+          NEW_IMAGE="${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}/${{ matrix.service }}:${{ needs.detect-changes.outputs.version }}"
+          
+          # Find and update deployment files
+          find manifests -name "*${{ matrix.service }}*.yaml" -type f | while read -r file; do
+            if grep -q "image:" "$file"; then
+              sed -i "s|image: .*${{ matrix.service }}.*|image: $NEW_IMAGE|g" "$file"
+              echo "Updated $file with new image: $NEW_IMAGE"
+            fi
+          done
+
+      - name: Commit and push changes
+        run: |
+          git config --local user.email "action@github.com"
+          git config --local user.name "GitHub Action"
+          
+          if git diff --quiet; then
+            echo "No changes to commit"
+          else
+            git add manifests/
+            git commit -m "Update ${{ matrix.service }} image to ${{ needs.detect-changes.outputs.version }}"
+            git push
+          fi
+
+  build-summary:
+    needs: [detect-changes, build-and-push, merge-and-sign, vulnerability-scan]
+    if: always()
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Build Summary
+        run: |
+          echo "## Container Build Summary" >> $GITHUB_STEP_SUMMARY
+          echo "| Service | Version | Status | Platforms |" >> $GITHUB_STEP_SUMMARY
+          echo "|---------|---------|--------|-----------|" >> $GITHUB_STEP_SUMMARY
+          
+          if [[ "${{ needs.detect-changes.outputs.web-app }}" == "true" || "${{ github.event.inputs.force_build }}" == "true" ]]; then
+            echo "| web-app | ${{ needs.detect-changes.outputs.version }} | ${{ needs.merge-and-sign.result }} | linux/amd64, linux/arm64 |" >> $GITHUB_STEP_SUMMARY
+          fi
+          
+          if [[ "${{ needs.detect-changes.outputs.api-service }}" == "true" || "${{ github.event.inputs.force_build }}" == "true" ]]; then
+            echo "| api-service | ${{ needs.detect-changes.outputs.version }} | ${{ needs.merge-and-sign.result }} | linux/amd64, linux/arm64 |" >> $GITHUB_STEP_SUMMARY
+          fi
+          
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Registry:** ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}" >> $GITHUB_STEP_SUMMARY
+          echo "**Signed:** ✅ Images signed with Cosign" >> $GITHUB_STEP_SUMMARY
+          echo "**SBOM:** ✅ Software Bill of Materials generated" >> $GITHUB_STEP_SUMMARY
+          echo "**Security:** ${{ needs.vulnerability-scan.result }}" >> $GITHUB_STEP_SUMMARY

@@ -1,0 +1,402 @@
+name: Security Scanning
+
+on:
+  push:
+    branches: [ main, develop ]
+  pull_request:
+    branches: [ main, develop ]
+  schedule:
+    # Run security scans daily at 2 AM UTC
+    - cron: '0 2 * * *'
+  workflow_dispatch:
+
+env:
+  NODE_VERSION: '18'
+
+permissions:
+  contents: read
+  security-events: write
+  actions: read
+
+jobs:
+  detect-changes:
+    runs-on: ubuntu-latest
+    outputs:
+      web-app: ${{ steps.changes.outputs.web-app }}
+      api-service: ${{ steps.changes.outputs.api-service }}
+      shared: ${{ steps.changes.outputs.shared }}
+      security-files: ${{ steps.changes.outputs.security-files }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Detect changes
+        uses: dorny/paths-filter@v2
+        id: changes
+        with:
+          filters: |
+            web-app:
+              - 'applications/web-app/**'
+              - 'shared/**'
+            api-service:
+              - 'applications/api-service/**'
+              - 'shared/**'
+            shared:
+              - 'shared/**'
+            security-files:
+              - '.github/workflows/**'
+              - 'Dockerfile*'
+              - 'package*.json'
+              - '.dockerignore'
+
+  sast-scanning:
+    runs-on: ubuntu-latest
+    needs: detect-changes
+    if: needs.detect-changes.outputs.security-files == 'true' || github.event_name == 'schedule'
+    
+    strategy:
+      matrix:
+        service: [web-app, api-service]
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Initialize CodeQL
+        uses: github/codeql-action/init@v2
+        with:
+          languages: javascript
+          queries: security-extended,security-and-quality
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: 'npm'
+          cache-dependency-path: 'applications/${{ matrix.service }}/package-lock.json'
+
+      - name: Install dependencies
+        working-directory: applications/${{ matrix.service }}
+        run: npm ci
+
+      - name: Perform CodeQL Analysis
+        uses: github/codeql-action/analyze@v2
+        with:
+          category: "/language:javascript/${{ matrix.service }}"
+
+      - name: Run Semgrep SAST
+        uses: returntocorp/semgrep-action@v1
+        with:
+          config: >-
+            p/security-audit
+            p/secrets
+            p/owasp-top-ten
+            p/javascript
+          generateSarif: "1"
+
+      - name: Upload Semgrep results to GitHub Security tab
+        uses: github/codeql-action/upload-sarif@v2
+        if: always()
+        with:
+          sarif_file: semgrep.sarif
+
+  secret-scanning:
+    runs-on: ubuntu-latest
+    needs: detect-changes
+    if: needs.detect-changes.outputs.security-files == 'true' || github.event_name == 'schedule'
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Run TruffleHog OSS
+        uses: trufflesecurity/trufflehog@main
+        with:
+          path: ./
+          base: ${{ github.event.repository.default_branch }}
+          head: HEAD
+          extra_args: --debug --only-verified
+
+      - name: Run GitLeaks
+        uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITLEAKS_LICENSE: ${{ secrets.GITLEAKS_LICENSE}}
+
+  dependency-scanning:
+    runs-on: ubuntu-latest
+    needs: detect-changes
+    if: needs.detect-changes.outputs.web-app == 'true' || needs.detect-changes.outputs.api-service == 'true' || github.event_name == 'schedule'
+    
+    strategy:
+      matrix:
+        service: 
+          - ${{ needs.detect-changes.outputs.web-app == 'true' && 'web-app' || '' }}
+          - ${{ needs.detect-changes.outputs.api-service == 'true' && 'api-service' || '' }}
+        exclude:
+          - service: ''
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: 'npm'
+          cache-dependency-path: 'applications/${{ matrix.service }}/package-lock.json'
+
+      - name: Install dependencies
+        working-directory: applications/${{ matrix.service }}
+        run: npm ci
+
+      - name: Run npm audit
+        working-directory: applications/${{ matrix.service }}
+        run: |
+          npm audit --audit-level=moderate --json > npm-audit-${{ matrix.service }}.json || true
+          npm audit --audit-level=moderate
+
+      - name: Run Snyk to check for vulnerabilities
+        uses: snyk/actions/node@master
+        env:
+          SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
+        with:
+          args: --severity-threshold=medium --file=applications/${{ matrix.service }}/package.json
+          command: test
+
+      - name: Upload Snyk results to GitHub Code Scanning
+        uses: github/codeql-action/upload-sarif@v2
+        if: always()
+        with:
+          sarif_file: snyk.sarif
+
+      - name: Upload npm audit results
+        uses: actions/upload-artifact@v3
+        if: always()
+        with:
+          name: npm-audit-${{ matrix.service }}
+          path: applications/${{ matrix.service }}/npm-audit-${{ matrix.service }}.json
+          retention-days: 30
+
+  container-scanning:
+    runs-on: ubuntu-latest
+    needs: detect-changes
+    if: needs.detect-changes.outputs.web-app == 'true' || needs.detect-changes.outputs.api-service == 'true' || github.event_name == 'schedule'
+    
+    strategy:
+      matrix:
+        service: 
+          - ${{ needs.detect-changes.outputs.web-app == 'true' && 'web-app' || '' }}
+          - ${{ needs.detect-changes.outputs.api-service == 'true' && 'api-service' || '' }}
+        exclude:
+          - service: ''
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build image for scanning
+        uses: docker/build-push-action@v5
+        with:
+          context: applications/${{ matrix.service }}
+          load: true
+          tags: ${{ matrix.service }}:scan
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Run Trivy vulnerability scanner
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: '${{ matrix.service }}:scan'
+          format: 'sarif'
+          output: 'trivy-${{ matrix.service }}.sarif'
+
+      - name: Upload Trivy scan results to GitHub Security tab
+        uses: github/codeql-action/upload-sarif@v2
+        if: always()
+        with:
+          sarif_file: 'trivy-${{ matrix.service }}.sarif'
+
+      - name: Run Grype vulnerability scanner
+        uses: anchore/scan-action@v3
+        id: grype-scan
+        with:
+          image: '${{ matrix.service }}:scan'
+          fail-build: false
+          severity-cutoff: medium
+
+      - name: Upload Grype scan results
+        uses: github/codeql-action/upload-sarif@v2
+        if: always()
+        with:
+          sarif_file: ${{ steps.grype-scan.outputs.sarif }}
+
+      - name: Run Docker Scout
+        if: github.event_name != 'pull_request'
+        uses: docker/scout-action@v1
+        with:
+          command: cves
+          image: '${{ matrix.service }}:scan'
+          sarif-file: 'scout-${{ matrix.service }}.sarif'
+          summary: true
+
+      - name: Upload Docker Scout results
+        if: github.event_name != 'pull_request'
+        uses: github/codeql-action/upload-sarif@v2
+        with:
+          sarif_file: 'scout-${{ matrix.service }}.sarif'
+
+  kubernetes-manifest-validation:
+    runs-on: ubuntu-latest
+    needs: detect-changes
+    if: needs.detect-changes.outputs.security-files == 'true' || github.event_name == 'schedule'
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up kubectl
+        uses: azure/setup-kubectl@v3
+        with:
+          version: 'v1.28.0'
+
+      - name: Install kubeval
+        run: |
+          wget https://github.com/instrumenta/kubeval/releases/latest/download/kubeval-linux-amd64.tar.gz
+          tar xf kubeval-linux-amd64.tar.gz
+          sudo mv kubeval /usr/local/bin
+
+      - name: Install kube-score
+        run: |
+          wget https://github.com/zegl/kube-score/releases/download/v1.16.1/kube-score_1.16.1_linux_amd64.tar.gz
+          tar xzf kube-score_1.16.1_linux_amd64.tar.gz
+          sudo mv kube-score /usr/local/bin
+
+      - name: Install Polaris
+        run: |
+          wget https://github.com/FairwindsOps/polaris/releases/download/8.5.1/polaris_linux_amd64.tar.gz
+          tar xzf polaris_linux_amd64.tar.gz
+          sudo mv polaris /usr/local/bin
+
+      - name: Validate Kubernetes manifests with kubeval
+        run: |
+          find manifests -name "*.yaml" -o -name "*.yml" | xargs kubeval --strict
+
+      - name: Analyze manifests with kube-score
+        run: |
+          find manifests -name "*.yaml" -o -name "*.yml" | xargs kube-score score --output-format sarif > kube-score.sarif || true
+
+      - name: Upload kube-score results
+        uses: github/codeql-action/upload-sarif@v2
+        if: always()
+        with:
+          sarif_file: kube-score.sarif
+
+      - name: Run Polaris audit
+        run: |
+          polaris audit --audit-path manifests --format sarif > polaris.sarif || true
+
+      - name: Upload Polaris results
+        uses: github/codeql-action/upload-sarif@v2
+        if: always()
+        with:
+          sarif_file: polaris.sarif
+
+  opa-policy-validation:
+    runs-on: ubuntu-latest
+    needs: detect-changes
+    if: needs.detect-changes.outputs.security-files == 'true' || github.event_name == 'schedule'
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install OPA
+        run: |
+          curl -L -o opa https://openpolicyagent.org/downloads/v0.57.0/opa_linux_amd64_static
+          chmod 755 ./opa
+          sudo mv opa /usr/local/bin
+
+      - name: Install Conftest
+        run: |
+          wget https://github.com/open-policy-agent/conftest/releases/download/v0.46.0/conftest_0.46.0_Linux_x86_64.tar.gz
+          tar xzf conftest_0.46.0_Linux_x86_64.tar.gz
+          sudo mv conftest /usr/local/bin
+
+      - name: Create OPA policies directory
+        run: mkdir -p policies
+
+      - name: Create security policies
+        run: |
+          cat > policies/security.rego << 'EOF'
+          package kubernetes.security
+
+          deny[msg] {
+            input.kind == "Deployment"
+            input.spec.template.spec.containers[_].securityContext.runAsRoot == true
+            msg := "Container must not run as root"
+          }
+
+          deny[msg] {
+            input.kind == "Deployment"
+            not input.spec.template.spec.containers[_].securityContext.readOnlyRootFilesystem
+            msg := "Container must have read-only root filesystem"
+          }
+
+          deny[msg] {
+            input.kind == "Deployment"
+            not input.spec.template.spec.containers[_].resources.limits.memory
+            msg := "Container must have memory limits"
+          }
+
+          deny[msg] {
+            input.kind == "Deployment"
+            not input.spec.template.spec.containers[_].resources.limits.cpu
+            msg := "Container must have CPU limits"
+          }
+          EOF
+
+      - name: Validate manifests with OPA policies
+        run: |
+          find manifests -name "*.yaml" -o -name "*.yml" | xargs conftest test --policy policies/
+
+  security-summary:
+    needs: [sast-scanning, secret-scanning, dependency-scanning, container-scanning, kubernetes-manifest-validation, opa-policy-validation]
+    if: always()
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Security Scan Summary
+        run: |
+          echo "## Security Scan Summary" >> $GITHUB_STEP_SUMMARY
+          echo "| Scan Type | Status |" >> $GITHUB_STEP_SUMMARY
+          echo "|-----------|--------|" >> $GITHUB_STEP_SUMMARY
+          echo "| SAST Scanning | ${{ needs.sast-scanning.result }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Secret Scanning | ${{ needs.secret-scanning.result }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Dependency Scanning | ${{ needs.dependency-scanning.result }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Container Scanning | ${{ needs.container-scanning.result }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Kubernetes Validation | ${{ needs.kubernetes-manifest-validation.result }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| OPA Policy Validation | ${{ needs.opa-policy-validation.result }} |" >> $GITHUB_STEP_SUMMARY
+          
+          # Set overall status
+          if [[ "${{ needs.sast-scanning.result }}" == "failure" || 
+                "${{ needs.secret-scanning.result }}" == "failure" || 
+                "${{ needs.dependency-scanning.result }}" == "failure" || 
+                "${{ needs.container-scanning.result }}" == "failure" || 
+                "${{ needs.kubernetes-manifest-validation.result }}" == "failure" || 
+                "${{ needs.opa-policy-validation.result }}" == "failure" ]]; then
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "❌ **Security scan failures detected. Please review and address the issues.**" >> $GITHUB_STEP_SUMMARY
+            exit 1
+          else
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "✅ **All security scans passed successfully.**" >> $GITHUB_STEP_SUMMARY
+          fi

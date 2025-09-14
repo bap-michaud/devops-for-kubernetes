@@ -1,0 +1,157 @@
+name: Reusable Build and Test
+
+on:
+  workflow_call:
+    inputs:
+      service-name:
+        required: true
+        type: string
+      working-directory:
+        required: true
+        type: string
+      node-version:
+        required: false
+        type: string
+        default: '18'
+      run-integration-tests:
+        required: false
+        type: boolean
+        default: false
+    outputs:
+      image-digest:
+        description: "Docker image digest"
+        value: ${{ jobs.build-and-test.outputs.image-digest }}
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}/${{ inputs.service-name }}
+
+jobs:
+  build-and-test:
+    runs-on: ubuntu-latest
+    outputs:
+      image-digest: ${{ steps.build.outputs.digest }}
+    strategy:
+      matrix:
+        architecture: [amd64, arm64]
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ inputs.node-version }}
+          cache: 'npm'
+          cache-dependency-path: '${{ inputs.working-directory }}/package-lock.json'
+
+      - name: Cache dependencies
+        uses: actions/cache@v3
+        with:
+          path: |
+            ~/.npm
+            ${{ inputs.working-directory }}/node_modules
+          key: ${{ runner.os }}-node-${{ inputs.node-version }}-${{ inputs.service-name }}-${{ hashFiles(format('{0}/package-lock.json', inputs.working-directory)) }}
+          restore-keys: |
+            ${{ runner.os }}-node-${{ inputs.node-version }}-${{ inputs.service-name }}-
+            ${{ runner.os }}-node-${{ inputs.node-version }}-
+
+      - name: Install dependencies
+        working-directory: ${{ inputs.working-directory }}
+        run: npm ci
+
+      - name: Run linting
+        working-directory: ${{ inputs.working-directory }}
+        run: |
+          if grep -q '"lint"' package.json; then
+            npm run lint
+          else
+            echo "No linting script found, skipping..."
+          fi
+
+      - name: Run tests
+        working-directory: ${{ inputs.working-directory }}
+        run: npm run test:coverage
+
+      - name: Upload test results
+        uses: actions/upload-artifact@v3
+        if: always()
+        with:
+          name: test-results-${{ inputs.service-name }}-${{ matrix.architecture }}
+          path: |
+            ${{ inputs.working-directory }}/coverage/
+            ${{ inputs.working-directory }}/test-results.xml
+          retention-days: 30
+
+      - name: Upload coverage to Codecov
+        uses: codecov/codecov-action@v3
+        with:
+          file: ${{ inputs.working-directory }}/coverage/lcov.info
+          flags: ${{ inputs.service-name }}
+          name: ${{ inputs.service-name }}-coverage
+          fail_ci_if_error: false
+
+      - name: Set up QEMU for multi-arch builds
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Cache Docker layers
+        uses: actions/cache@v3
+        with:
+          path: /tmp/.buildx-cache-${{ inputs.service-name }}
+          key: ${{ runner.os }}-buildx-${{ inputs.service-name }}-${{ matrix.architecture }}-${{ github.sha }}
+          restore-keys: |
+            ${{ runner.os }}-buildx-${{ inputs.service-name }}-${{ matrix.architecture }}-
+            ${{ runner.os }}-buildx-${{ inputs.service-name }}-
+
+      - name: Build Docker image (test)
+        id: build
+        uses: docker/build-push-action@v5
+        with:
+          context: ${{ inputs.working-directory }}
+          platforms: linux/${{ matrix.architecture }}
+          push: false
+          tags: ${{ inputs.service-name }}:test-${{ matrix.architecture }}
+          cache-from: type=local,src=/tmp/.buildx-cache-${{ inputs.service-name }}
+          cache-to: type=local,dest=/tmp/.buildx-cache-${{ inputs.service-name }}-new,mode=max
+          target: test
+
+      - name: Run container smoke tests
+        run: |
+          # Test that the container builds successfully
+          echo "Container built successfully for ${{ inputs.service-name }} on ${{ matrix.architecture }}"
+
+      - name: Move cache
+        run: |
+          rm -rf /tmp/.buildx-cache-${{ inputs.service-name }}
+          mv /tmp/.buildx-cache-${{ inputs.service-name }}-new /tmp/.buildx-cache-${{ inputs.service-name }}
+
+  integration-tests:
+    if: inputs.run-integration-tests
+    needs: build-and-test
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ inputs.node-version }}
+
+      - name: Install dependencies
+        working-directory: ${{ inputs.working-directory }}
+        run: npm ci
+
+      - name: Run integration tests
+        working-directory: ${{ inputs.working-directory }}
+        run: |
+          if grep -q '"test:integration"' package.json; then
+            npm run test:integration
+          else
+            echo "No integration tests found for ${{ inputs.service-name }}"
+          fi

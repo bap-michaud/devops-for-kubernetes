@@ -1,0 +1,170 @@
+# GitLeaks Configuration for DevOps Pipeline Security
+
+title = "DevOps Pipeline Security Configuration"
+
+# Global settings
+[extend]
+# Extend default rules
+useDefault = true
+
+# Custom rules for additional security
+[[rules]]
+id = "kubernetes-secret"
+description = "Kubernetes Secret"
+regex = '''(?i)(k8s|kubernetes).*secret.*[=:]\s*["']?([a-zA-Z0-9+/]{20,})["']?'''
+tags = ["secret", "kubernetes"]
+
+[[rules]]
+id = "docker-registry-token"
+description = "Docker Registry Token"
+regex = '''(?i)docker.*token.*[=:]\s*["']?([a-zA-Z0-9+/]{20,})["']?'''
+tags = ["secret", "docker"]
+
+[[rules]]
+id = "github-token"
+description = "GitHub Token"
+regex = '''(?i)github.*token.*[=:]\s*["']?(ghp_[a-zA-Z0-9]{36})["']?'''
+tags = ["secret", "github"]
+
+[[rules]]
+id = "aws-access-key"
+description = "AWS Access Key"
+regex = '''(?i)aws.*access.*key.*[=:]\s*["']?(AKIA[0-9A-Z]{16})["']?'''
+tags = ["secret", "aws"]
+
+[[rules]]
+id = "aws-secret-key"
+description = "AWS Secret Key"
+regex = '''(?i)aws.*secret.*key.*[=:]\s*["']?([a-zA-Z0-9+/]{40})["']?'''
+tags = ["secret", "aws"]
+
+[[rules]]
+id = "database-connection-string"
+description = "Database Connection String"
+regex = '''(?i)(postgres|mysql|mongodb)://[a-zA-Z0-9]+:[a-zA-Z0-9]+@[a-zA-Z0-9.-]+:[0-9]+/[a-zA-Z0-9]+'''
+tags = ["secret", "database"]
+
+[[rules]]
+id = "jwt-secret"
+description = "JWT Secret"
+regex = '''(?i)jwt.*secret.*[=:]\s*["']?([a-zA-Z0-9+/]{32,})["']?'''
+tags = ["secret", "jwt"]
+
+[[rules]]
+id = "api-key-generic"
+description = "Generic API Key"
+regex = '''(?i)api.*key.*[=:]\s*["']?([a-zA-Z0-9]{32,})["']?'''
+tags = ["secret", "api"]
+
+# Allowlist for false positives
+[allowlist]
+description = "Allowlist for false positives"
+regexes = [
+    '''example\.com''',
+    '''localhost''',
+    '''127\.0\.0\.1''',
+    '''0\.0\.0\.0''',
+    '''test.*password''',
+    '''dummy.*secret''',
+    '''placeholder.*key''',
+    '''YOUR_.*_HERE''',
+    '''<.*>''',
+    '''\$\{.*\}''',
+    '''%.*%''',
+    '''CHANGE_ME''',
+    '''REPLACE_WITH''',
+]
+
+paths = [
+    '''\.git/''',
+    '''node_modules/''',
+    '''vendor/''',
+    '''\.terraform/''',
+    '''coverage/''',
+    '''dist/''',
+    '''build/''',
+    '''target/''',
+    '''\.nyc_output/''',
+    '''test/fixtures/''',
+    '''examples/.*\.md''',
+    '''README\.md''',
+    '''CHANGELOG\.md''',
+    '''LICENSE''',
+]
+
+commits = [
+    # Add specific commit SHAs to allowlist if needed
+]
+
+# File extensions to scan
+[allowlist.files]
+extensions = [
+    "js",
+    "ts",
+    "json",
+    "yaml",
+    "yml",
+    "env",
+    "config",
+    "conf",
+    "properties",
+    "xml",
+    "dockerfile",
+    "sh",
+    "bash",
+    "zsh",
+    "py",
+    "rb",
+    "go",
+    "java",
+    "cs",
+    "php",
+    "sql",
+    "tf",
+    "tfvars",
+    "hcl",
+]
+
+# Entropy settings for detecting high-entropy strings
+[allowlist.entropy]
+# Minimum entropy for detection
+min = 3.5
+# Maximum entropy to avoid false positives
+max = 8.0
+# Groups to apply entropy detection
+groups = [
+    "secret",
+    "key",
+    "token",
+    "password",
+]
+
+# Stopwords to reduce false positives
+stopwords = [
+    "example",
+    "test",
+    "demo",
+    "sample",
+    "placeholder",
+    "dummy",
+    "fake",
+    "mock",
+    "template",
+    "default",
+    "localhost",
+    "127.0.0.1",
+    "0.0.0.0",
+    "null",
+    "undefined",
+    "true",
+    "false",
+]
+
+# Report settings
+[report]
+# Format options: json, csv, sarif
+format = "json"
+# Include git blame information
+blame = true
+# Include file content in report
+content = false

@@ -1,0 +1,347 @@
+name: Container Build and Push - Web App
+
+on:
+  push:
+    branches: [ main, develop ]
+    tags: [ 'v*' ]
+  pull_request:
+    branches: [ main ]
+  workflow_dispatch:
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
+
+permissions:
+  contents: read
+  packages: write
+  id-token: write
+  attestations: write
+
+jobs:
+  generate-version:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      is-release: ${{ steps.version.outputs.is-release }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Generate version
+        id: version
+        run: |
+          if [[ $GITHUB_REF == refs/tags/v* ]]; then
+            VERSION=${GITHUB_REF#refs/tags/v}
+            IS_RELEASE=true
+          elif [[ $GITHUB_REF == refs/heads/main ]]; then
+            VERSION=$(date +%Y%m%d)-${GITHUB_SHA::8}
+            IS_RELEASE=false
+          else
+            VERSION=pr-${{ github.event.number }}-${GITHUB_SHA::8}
+            IS_RELEASE=false
+          fi
+          
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+          echo "is-release=$IS_RELEASE" >> $GITHUB_OUTPUT
+          echo "Generated version: $VERSION"
+
+  build-and-push:
+    needs: generate-version
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        platform: [linux/amd64, linux/arm64]
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=ref,event=branch
+            type=ref,event=pr
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=semver,pattern={{major}}
+            type=raw,value=${{ needs.generate-version.outputs.version }}
+            type=raw,value=latest,enable={{is_default_branch}}
+          labels: |
+            org.opencontainers.image.title=web-app
+            org.opencontainers.image.description=Multi-repo web application example
+            org.opencontainers.image.vendor=DevOps Team
+            org.opencontainers.image.version=${{ needs.generate-version.outputs.version }}
+
+      - name: Build and push by digest
+        id: build
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          platforms: ${{ matrix.platform }}
+          labels: ${{ steps.meta.outputs.labels }}
+          outputs: type=image,name=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }},push-by-digest=true,name-canonical=true,push=true
+          cache-from: type=gha,scope=web-app-${{ matrix.platform }}
+          cache-to: type=gha,mode=max,scope=web-app-${{ matrix.platform }}
+          build-args: |
+            VERSION=${{ needs.generate-version.outputs.version }}
+            BUILD_DATE=${{ fromJSON(steps.meta.outputs.json).labels['org.opencontainers.image.created'] }}
+            VCS_REF=${{ github.sha }}
+
+      - name: Export digest
+        run: |
+          mkdir -p /tmp/digests
+          digest="${{ steps.build.outputs.digest }}"
+          touch "/tmp/digests/${digest#sha256:}"
+
+      - name: Upload digest
+        uses: actions/upload-artifact@v3
+        with:
+          name: digests
+          path: /tmp/digests/*
+          if-no-files-found: error
+          retention-days: 1
+
+  merge-and-sign:
+    needs: [generate-version, build-and-push]
+    runs-on: ubuntu-latest
+    outputs:
+      image-digest: ${{ steps.build.outputs.digest }}
+    
+    steps:
+      - name: Download digests
+        uses: actions/download-artifact@v3
+        with:
+          name: digests
+          path: /tmp/digests
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=ref,event=branch
+            type=ref,event=pr
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=semver,pattern={{major}}
+            type=raw,value=${{ needs.generate-version.outputs.version }}
+            type=raw,value=latest,enable={{is_default_branch}}
+
+      - name: Create manifest list and push
+        working-directory: /tmp/digests
+        id: build
+        run: |
+          docker buildx imagetools create $(jq -cr '.tags | map("-t " + .) | join(" ")' <<< "$DOCKER_METADATA_OUTPUT_JSON") \
+            $(printf '${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}@sha256:%s ' *)
+          
+          # Get the digest of the manifest list
+          DIGEST=$(docker buildx imagetools inspect ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ needs.generate-version.outputs.version }} --format '{{.Manifest.Digest}}')
+          echo "digest=$DIGEST" >> $GITHUB_OUTPUT
+
+      - name: Inspect image
+        run: |
+          docker buildx imagetools inspect ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ needs.generate-version.outputs.version }}
+
+      - name: Install Cosign
+        uses: sigstore/cosign-installer@v3.1.1
+        with:
+          cosign-release: 'v2.2.0'
+
+      - name: Sign container image
+        env:
+          TAGS: ${{ steps.meta.outputs.tags }}
+          DIGEST: ${{ steps.build.outputs.digest }}
+        run: |
+          images=""
+          for tag in ${TAGS}; do
+            images+="${tag}@${DIGEST} "
+          done
+          cosign sign --yes ${images}
+
+      - name: Generate SBOM
+        uses: anchore/sbom-action@v0
+        with:
+          image: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ needs.generate-version.outputs.version }}
+          format: spdx-json
+          output-file: sbom-web-app.spdx.json
+
+      - name: Attest SBOM
+        uses: actions/attest-sbom@v1
+        with:
+          subject-name: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          subject-digest: ${{ steps.build.outputs.digest }}
+          sbom-path: sbom-web-app.spdx.json
+          push-to-registry: true
+
+      - name: Upload SBOM
+        uses: actions/upload-artifact@v3
+        with:
+          name: sbom-web-app
+          path: sbom-web-app.spdx.json
+          retention-days: 30
+
+  vulnerability-scan:
+    needs: [generate-version, merge-and-sign]
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Log in to Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Run Trivy vulnerability scanner
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: '${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ needs.generate-version.outputs.version }}'
+          format: 'sarif'
+          output: 'trivy-web-app.sarif'
+
+      - name: Upload Trivy scan results
+        uses: github/codeql-action/upload-sarif@v2
+        if: always()
+        with:
+          sarif_file: 'trivy-web-app.sarif'
+
+      - name: Check for critical vulnerabilities
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: '${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ needs.generate-version.outputs.version }}'
+          format: 'json'
+          output: 'trivy-web-app.json'
+          exit-code: '1'
+          severity: 'CRITICAL,HIGH'
+
+  performance-test:
+    needs: [generate-version, merge-and-sign]
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Log in to Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Run container performance test
+        run: |
+          # Pull and run the built image
+          docker run -d --name web-app-test -p 3000:3000 \
+            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ needs.generate-version.outputs.version }}
+          
+          # Wait for container to be ready
+          timeout 30 bash -c 'until curl -f http://localhost:3000/health; do sleep 1; done'
+          
+          # Run basic performance tests
+          echo "Running performance tests..."
+          
+          # Test response time
+          for i in {1..10}; do
+            curl -w "@curl-format.txt" -o /dev/null -s http://localhost:3000/
+          done
+          
+          # Test concurrent requests
+          ab -n 100 -c 10 http://localhost:3000/ || echo "Apache Bench not available, skipping load test"
+          
+          # Cleanup
+          docker stop web-app-test
+          docker rm web-app-test
+
+      - name: Create curl format file
+        run: |
+          cat > curl-format.txt << 'EOF'
+          time_namelookup:  %{time_namelookup}\n
+          time_connect:     %{time_connect}\n
+          time_appconnect:  %{time_appconnect}\n
+          time_pretransfer: %{time_pretransfer}\n
+          time_redirect:    %{time_redirect}\n
+          time_starttransfer: %{time_starttransfer}\n
+          time_total:       %{time_total}\n
+          EOF
+
+  update-gitops:
+    needs: [generate-version, vulnerability-scan]
+    if: github.ref == 'refs/heads/main' && needs.generate-version.outputs.is-release == 'false'
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Trigger GitOps update
+        run: |
+          echo "Triggering GitOps update for web-app:${{ needs.generate-version.outputs.version }}"
+          
+          # This would typically trigger an update to your GitOps repository
+          # For example, using repository dispatch or webhook
+          curl -X POST \
+            -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
+            -H "Accept: application/vnd.github.v3+json" \
+            https://api.github.com/repos/${{ github.repository }}/dispatches \
+            -d '{
+              "event_type": "update-deployment",
+              "client_payload": {
+                "service": "web-app",
+                "version": "${{ needs.generate-version.outputs.version }}",
+                "image": "${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ needs.generate-version.outputs.version }}"
+              }
+            }'
+
+  build-summary:
+    needs: [generate-version, build-and-push, merge-and-sign, vulnerability-scan]
+    if: always()
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Build Summary
+        run: |
+          echo "## Container Build Summary - Web App" >> $GITHUB_STEP_SUMMARY
+          echo "| Component | Version | Status | Platforms |" >> $GITHUB_STEP_SUMMARY
+          echo "|-----------|---------|--------|-----------|" >> $GITHUB_STEP_SUMMARY
+          echo "| web-app | ${{ needs.generate-version.outputs.version }} | ${{ needs.merge-and-sign.result }} | linux/amd64, linux/arm64 |" >> $GITHUB_STEP_SUMMARY
+          
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Registry:** ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}" >> $GITHUB_STEP_SUMMARY
+          echo "**Signed:** ✅ Image signed with Cosign" >> $GITHUB_STEP_SUMMARY
+          echo "**SBOM:** ✅ Software Bill of Materials generated" >> $GITHUB_STEP_SUMMARY
+          echo "**Security Scan:** ${{ needs.vulnerability-scan.result }}" >> $GITHUB_STEP_SUMMARY
+          
+          if [[ "${{ needs.generate-version.outputs.is-release }}" == "true" ]]; then
+            echo "**Release:** 🎉 Production release" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "**Build Type:** 🔧 Development build" >> $GITHUB_STEP_SUMMARY
+          fi

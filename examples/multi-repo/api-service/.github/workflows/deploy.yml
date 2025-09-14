@@ -1,0 +1,657 @@
+name: Deploy API Service
+
+on:
+  workflow_run:
+    workflows: ["Container Build and Push - API Service"]
+    types:
+      - completed
+    branches: [main, develop]
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Environment to deploy to'
+        required: true
+        default: 'development'
+        type: choice
+        options:
+          - development
+          - staging
+          - production
+      version:
+        description: 'Version to deploy (leave empty for latest)'
+        required: false
+        type: string
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
+  SERVICE_NAME: api-service
+
+permissions:
+  contents: read
+  packages: read
+  deployments: write
+  id-token: write
+
+jobs:
+  determine-deployment:
+    runs-on: ubuntu-latest
+    outputs:
+      environment: ${{ steps.env.outputs.environment }}
+      version: ${{ steps.version.outputs.version }}
+      should-deploy: ${{ steps.check.outputs.should-deploy }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Determine environment
+        id: env
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            ENVIRONMENT="${{ github.event.inputs.environment }}"
+          elif [ "${{ github.ref }}" = "refs/heads/main" ]; then
+            ENVIRONMENT="development"
+          elif [ "${{ github.ref }}" = "refs/heads/develop" ]; then
+            ENVIRONMENT="development"
+          else
+            ENVIRONMENT="review"
+          fi
+          
+          echo "environment=$ENVIRONMENT" >> $GITHUB_OUTPUT
+          echo "Determined environment: $ENVIRONMENT"
+
+      - name: Determine version
+        id: version
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ] && [ -n "${{ github.event.inputs.version }}" ]; then
+            VERSION="${{ github.event.inputs.version }}"
+          else
+            VERSION="$(date +%Y%m%d)-${GITHUB_SHA::8}"
+          fi
+          
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+          echo "Version to deploy: $VERSION"
+
+      - name: Check if should deploy
+        id: check
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "should-deploy=true" >> $GITHUB_OUTPUT
+          elif [ "${{ github.event.workflow_run.conclusion }}" = "success" ]; then
+            echo "should-deploy=true" >> $GITHUB_OUTPUT
+          else
+            echo "should-deploy=false" >> $GITHUB_OUTPUT
+          fi
+
+  deploy-development:
+    needs: determine-deployment
+    if: needs.determine-deployment.outputs.should-deploy == 'true' && needs.determine-deployment.outputs.environment == 'development'
+    runs-on: ubuntu-latest
+    environment: 
+      name: development
+      url: https://api-dev.example.com
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup kubectl
+        uses: azure/setup-kubectl@v3
+        with:
+          version: 'v1.28.0'
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_DEV }}
+          aws-region: us-east-1
+
+      - name: Update kubeconfig
+        run: |
+          aws eks update-kubeconfig --region us-east-1 --name dev-cluster
+
+      - name: Create namespace if not exists
+        run: |
+          kubectl create namespace api-dev --dry-run=client -o yaml | kubectl apply -f -
+
+      - name: Deploy database (development)
+        run: |
+          # Deploy PostgreSQL for development
+          cat << EOF | kubectl apply -f -
+          apiVersion: apps/v1
+          kind: Deployment
+          metadata:
+            name: postgres
+            namespace: api-dev
+          spec:
+            replicas: 1
+            selector:
+              matchLabels:
+                app: postgres
+            template:
+              metadata:
+                labels:
+                  app: postgres
+              spec:
+                containers:
+                - name: postgres
+                  image: postgres:15-alpine
+                  env:
+                  - name: POSTGRES_DB
+                    value: "apidb"
+                  - name: POSTGRES_USER
+                    value: "apiuser"
+                  - name: POSTGRES_PASSWORD
+                    value: "devpassword"
+                  ports:
+                  - containerPort: 5432
+                  volumeMounts:
+                  - name: postgres-storage
+                    mountPath: /var/lib/postgresql/data
+                volumes:
+                - name: postgres-storage
+                  emptyDir: {}
+          ---
+          apiVersion: v1
+          kind: Service
+          metadata:
+            name: postgres
+            namespace: api-dev
+          spec:
+            selector:
+              app: postgres
+            ports:
+            - port: 5432
+              targetPort: 5432
+          EOF
+
+      - name: Deploy API service to development
+        run: |
+          IMAGE="${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ needs.determine-deployment.outputs.version }}"
+          
+          cat << EOF | kubectl apply -f -
+          apiVersion: apps/v1
+          kind: Deployment
+          metadata:
+            name: ${{ env.SERVICE_NAME }}
+            namespace: api-dev
+            labels:
+              app: ${{ env.SERVICE_NAME }}
+              environment: development
+          spec:
+            replicas: 1
+            selector:
+              matchLabels:
+                app: ${{ env.SERVICE_NAME }}
+            template:
+              metadata:
+                labels:
+                  app: ${{ env.SERVICE_NAME }}
+                  version: ${{ needs.determine-deployment.outputs.version }}
+              spec:
+                containers:
+                - name: ${{ env.SERVICE_NAME }}
+                  image: $IMAGE
+                  ports:
+                  - containerPort: 8080
+                  env:
+                  - name: NODE_ENV
+                    value: "development"
+                  - name: PORT
+                    value: "8080"
+                  - name: DATABASE_URL
+                    value: "postgresql://apiuser:devpassword@postgres:5432/apidb"
+                  resources:
+                    requests:
+                      memory: "128Mi"
+                      cpu: "100m"
+                    limits:
+                      memory: "256Mi"
+                      cpu: "200m"
+                  livenessProbe:
+                    httpGet:
+                      path: /health
+                      port: 8080
+                    initialDelaySeconds: 30
+                    periodSeconds: 10
+                  readinessProbe:
+                    httpGet:
+                      path: /health
+                      port: 8080
+                    initialDelaySeconds: 10
+                    periodSeconds: 5
+          ---
+          apiVersion: v1
+          kind: Service
+          metadata:
+            name: ${{ env.SERVICE_NAME }}
+            namespace: api-dev
+          spec:
+            selector:
+              app: ${{ env.SERVICE_NAME }}
+            ports:
+            - port: 80
+              targetPort: 8080
+            type: LoadBalancer
+          EOF
+
+      - name: Wait for deployment
+        run: |
+          kubectl rollout status deployment/postgres -n api-dev --timeout=300s
+          kubectl rollout status deployment/${{ env.SERVICE_NAME }} -n api-dev --timeout=300s
+
+      - name: Run smoke tests
+        run: |
+          SERVICE_IP=$(kubectl get service ${{ env.SERVICE_NAME }} -n api-dev -o jsonpath='{.status.loadBalancer.ingress[0].ip}' || echo "localhost")
+          
+          timeout 60 bash -c "until curl -f http://$SERVICE_IP/health 2>/dev/null; do sleep 5; done" || echo "Health check timeout"
+          
+          echo "Running smoke tests for API service"
+          curl -f "http://$SERVICE_IP/health" || exit 1
+          curl -f "http://$SERVICE_IP/api/status" || exit 1
+
+  deploy-staging:
+    needs: [determine-deployment, deploy-development]
+    if: needs.determine-deployment.outputs.should-deploy == 'true' && (needs.determine-deployment.outputs.environment == 'staging' || (needs.determine-deployment.outputs.environment == 'development' && github.ref == 'refs/heads/main'))
+    runs-on: ubuntu-latest
+    environment: 
+      name: staging
+      url: https://api-staging.example.com
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup kubectl
+        uses: azure/setup-kubectl@v3
+        with:
+          version: 'v1.28.0'
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_STAGING }}
+          aws-region: us-east-1
+
+      - name: Update kubeconfig
+        run: |
+          aws eks update-kubeconfig --region us-east-1 --name staging-cluster
+
+      - name: Create namespace if not exists
+        run: |
+          kubectl create namespace api-staging --dry-run=client -o yaml | kubectl apply -f -
+
+      - name: Deploy to staging
+        run: |
+          IMAGE="${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ needs.determine-deployment.outputs.version }}"
+          
+          cat << EOF | kubectl apply -f -
+          apiVersion: apps/v1
+          kind: Deployment
+          metadata:
+            name: ${{ env.SERVICE_NAME }}
+            namespace: api-staging
+            labels:
+              app: ${{ env.SERVICE_NAME }}
+              environment: staging
+          spec:
+            replicas: 2
+            selector:
+              matchLabels:
+                app: ${{ env.SERVICE_NAME }}
+            template:
+              metadata:
+                labels:
+                  app: ${{ env.SERVICE_NAME }}
+                  version: ${{ needs.determine-deployment.outputs.version }}
+              spec:
+                containers:
+                - name: ${{ env.SERVICE_NAME }}
+                  image: $IMAGE
+                  ports:
+                  - containerPort: 8080
+                  env:
+                  - name: NODE_ENV
+                    value: "staging"
+                  - name: PORT
+                    value: "8080"
+                  - name: DATABASE_URL
+                    valueFrom:
+                      secretKeyRef:
+                        name: database-secret
+                        key: url
+                  resources:
+                    requests:
+                      memory: "256Mi"
+                      cpu: "200m"
+                    limits:
+                      memory: "512Mi"
+                      cpu: "400m"
+                  livenessProbe:
+                    httpGet:
+                      path: /health
+                      port: 8080
+                    initialDelaySeconds: 30
+                    periodSeconds: 10
+                  readinessProbe:
+                    httpGet:
+                      path: /health
+                      port: 8080
+                    initialDelaySeconds: 10
+                    periodSeconds: 5
+          ---
+          apiVersion: v1
+          kind: Service
+          metadata:
+            name: ${{ env.SERVICE_NAME }}
+            namespace: api-staging
+          spec:
+            selector:
+              app: ${{ env.SERVICE_NAME }}
+            ports:
+            - port: 80
+              targetPort: 8080
+            type: ClusterIP
+          ---
+          apiVersion: networking.k8s.io/v1
+          kind: Ingress
+          metadata:
+            name: ${{ env.SERVICE_NAME }}
+            namespace: api-staging
+            annotations:
+              kubernetes.io/ingress.class: nginx
+              cert-manager.io/cluster-issuer: letsencrypt-prod
+          spec:
+            tls:
+            - hosts:
+              - api-staging.example.com
+              secretName: api-staging-tls
+            rules:
+            - host: api-staging.example.com
+              http:
+                paths:
+                - path: /
+                  pathType: Prefix
+                  backend:
+                    service:
+                      name: ${{ env.SERVICE_NAME }}
+                      port:
+                        number: 80
+          EOF
+
+      - name: Wait for deployment
+        run: |
+          kubectl rollout status deployment/${{ env.SERVICE_NAME }} -n api-staging --timeout=600s
+
+      - name: Run integration tests
+        run: |
+          timeout 120 bash -c "until curl -f https://api-staging.example.com/health 2>/dev/null; do sleep 10; done" || echo "Health check timeout"
+          
+          echo "Running integration tests for API service"
+          curl -f "https://api-staging.example.com/health" || exit 1
+          curl -f "https://api-staging.example.com/api/status" || exit 1
+          
+          # API-specific tests
+          curl -X POST -H "Content-Type: application/json" -d '{"test": "data"}' "https://api-staging.example.com/api/test" || echo "POST test failed"
+          
+          # Load test
+          if command -v ab >/dev/null 2>&1; then
+            ab -n 100 -c 5 "https://api-staging.example.com/api/status"
+          fi
+
+  deploy-production:
+    needs: [determine-deployment, deploy-staging]
+    if: needs.determine-deployment.outputs.should-deploy == 'true' && needs.determine-deployment.outputs.environment == 'production'
+    runs-on: ubuntu-latest
+    environment: 
+      name: production
+      url: https://api.example.com
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup kubectl
+        uses: azure/setup-kubectl@v3
+        with:
+          version: 'v1.28.0'
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_PROD }}
+          aws-region: us-east-1
+
+      - name: Update kubeconfig
+        run: |
+          aws eks update-kubeconfig --region us-east-1 --name prod-cluster
+
+      - name: Backup current deployment
+        run: |
+          kubectl get deployment ${{ env.SERVICE_NAME }} -n api-prod -o yaml > backup-api-service-$(date +%Y%m%d-%H%M%S).yaml || echo "No existing deployment to backup"
+
+      - name: Deploy to production
+        run: |
+          IMAGE="${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ needs.determine-deployment.outputs.version }}"
+          
+          cat << EOF | kubectl apply -f -
+          apiVersion: apps/v1
+          kind: Deployment
+          metadata:
+            name: ${{ env.SERVICE_NAME }}
+            namespace: api-prod
+            labels:
+              app: ${{ env.SERVICE_NAME }}
+              environment: production
+          spec:
+            replicas: 3
+            strategy:
+              type: RollingUpdate
+              rollingUpdate:
+                maxSurge: 1
+                maxUnavailable: 0
+            selector:
+              matchLabels:
+                app: ${{ env.SERVICE_NAME }}
+            template:
+              metadata:
+                labels:
+                  app: ${{ env.SERVICE_NAME }}
+                  version: ${{ needs.determine-deployment.outputs.version }}
+              spec:
+                affinity:
+                  podAntiAffinity:
+                    preferredDuringSchedulingIgnoredDuringExecution:
+                    - weight: 100
+                      podAffinityTerm:
+                        labelSelector:
+                          matchExpressions:
+                          - key: app
+                            operator: In
+                            values:
+                            - ${{ env.SERVICE_NAME }}
+                        topologyKey: kubernetes.io/hostname
+                containers:
+                - name: ${{ env.SERVICE_NAME }}
+                  image: $IMAGE
+                  ports:
+                  - containerPort: 8080
+                  env:
+                  - name: NODE_ENV
+                    value: "production"
+                  - name: PORT
+                    value: "8080"
+                  - name: DATABASE_URL
+                    valueFrom:
+                      secretKeyRef:
+                        name: database-secret
+                        key: url
+                  resources:
+                    requests:
+                      memory: "512Mi"
+                      cpu: "500m"
+                    limits:
+                      memory: "1Gi"
+                      cpu: "1000m"
+                  livenessProbe:
+                    httpGet:
+                      path: /health
+                      port: 8080
+                    initialDelaySeconds: 30
+                    periodSeconds: 10
+                    timeoutSeconds: 5
+                    failureThreshold: 3
+                  readinessProbe:
+                    httpGet:
+                      path: /health
+                      port: 8080
+                    initialDelaySeconds: 10
+                    periodSeconds: 5
+                    timeoutSeconds: 3
+                    failureThreshold: 3
+          ---
+          apiVersion: v1
+          kind: Service
+          metadata:
+            name: ${{ env.SERVICE_NAME }}
+            namespace: api-prod
+          spec:
+            selector:
+              app: ${{ env.SERVICE_NAME }}
+            ports:
+            - port: 80
+              targetPort: 8080
+            type: ClusterIP
+          ---
+          apiVersion: networking.k8s.io/v1
+          kind: Ingress
+          metadata:
+            name: ${{ env.SERVICE_NAME }}
+            namespace: api-prod
+            annotations:
+              kubernetes.io/ingress.class: nginx
+              cert-manager.io/cluster-issuer: letsencrypt-prod
+              nginx.ingress.kubernetes.io/rate-limit: "1000"
+              nginx.ingress.kubernetes.io/rate-limit-window: "1m"
+              nginx.ingress.kubernetes.io/ssl-redirect: "true"
+          spec:
+            tls:
+            - hosts:
+              - api.example.com
+              secretName: api-prod-tls
+            rules:
+            - host: api.example.com
+              http:
+                paths:
+                - path: /
+                  pathType: Prefix
+                  backend:
+                    service:
+                      name: ${{ env.SERVICE_NAME }}
+                      port:
+                        number: 80
+          EOF
+
+      - name: Wait for deployment
+        run: |
+          kubectl rollout status deployment/${{ env.SERVICE_NAME }} -n api-prod --timeout=900s
+          kubectl wait --for=condition=ready pod -l app=${{ env.SERVICE_NAME }} -n api-prod --timeout=300s
+
+      - name: Run production validation
+        run: |
+          timeout 180 bash -c "until curl -f https://api.example.com/health 2>/dev/null; do sleep 15; done" || echo "Health check timeout"
+          
+          echo "Running production validation for API service"
+          curl -f "https://api.example.com/health" || exit 1
+          curl -f "https://api.example.com/api/status" || exit 1
+          
+          # Performance validation
+          if command -v ab >/dev/null 2>&1; then
+            ab -n 50 -c 2 "https://api.example.com/api/status"
+          fi
+
+      - name: Monitor deployment
+        run: |
+          echo "Monitoring API service deployment for 5 minutes..."
+          
+          for i in {1..10}; do
+            READY_PODS=$(kubectl get pods -l app=${{ env.SERVICE_NAME }} -n api-prod -o jsonpath='{.items[?(@.status.phase=="Running")].metadata.name}' | wc -w)
+            TOTAL_PODS=$(kubectl get pods -l app=${{ env.SERVICE_NAME }} -n api-prod --no-headers | wc -l)
+            
+            echo "Ready pods: $READY_PODS/$TOTAL_PODS"
+            
+            # Test API endpoints
+            curl -f "https://api.example.com/health" || echo "Health check failed"
+            curl -f "https://api.example.com/api/status" || echo "Status check failed"
+            
+            sleep 30
+          done
+
+      - name: Send notification
+        if: always()
+        run: |
+          if [ "${{ job.status }}" = "success" ]; then
+            curl -X POST "${{ secrets.SLACK_WEBHOOK_URL }}" \
+              -H 'Content-type: application/json' \
+              --data '{
+                "text": "🚀 API Service Production Deployment Successful",
+                "attachments": [{
+                  "color": "good",
+                  "fields": [{
+                    "title": "Version",
+                    "value": "${{ needs.determine-deployment.outputs.version }}",
+                    "short": true
+                  }, {
+                    "title": "URL",
+                    "value": "https://api.example.com",
+                    "short": true
+                  }]
+                }]
+              }' || echo "Notification failed"
+          else
+            curl -X POST "${{ secrets.SLACK_WEBHOOK_URL }}" \
+              -H 'Content-type: application/json' \
+              --data '{
+                "text": "🚨 API Service Production Deployment Failed",
+                "attachments": [{
+                  "color": "danger",
+                  "fields": [{
+                    "title": "Version",
+                    "value": "${{ needs.determine-deployment.outputs.version }}",
+                    "short": true
+                  }]
+                }]
+              }' || echo "Notification failed"
+          fi
+
+  deployment-summary:
+    needs: [determine-deployment, deploy-development, deploy-staging, deploy-production]
+    if: always()
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Deployment Summary
+        run: |
+          echo "## API Service Deployment Summary" >> $GITHUB_STEP_SUMMARY
+          echo "| Environment | Version | Status | URL |" >> $GITHUB_STEP_SUMMARY
+          echo "|-------------|---------|--------|-----|" >> $GITHUB_STEP_SUMMARY
+          
+          ENVIRONMENT="${{ needs.determine-deployment.outputs.environment }}"
+          VERSION="${{ needs.determine-deployment.outputs.version }}"
+          
+          if [ "$ENVIRONMENT" = "development" ]; then
+            STATUS="${{ needs.deploy-development.result }}"
+            URL="https://api-dev.example.com"
+          elif [ "$ENVIRONMENT" = "staging" ]; then
+            STATUS="${{ needs.deploy-staging.result }}"
+            URL="https://api-staging.example.com"
+          elif [ "$ENVIRONMENT" = "production" ]; then
+            STATUS="${{ needs.deploy-production.result }}"
+            URL="https://api.example.com"
+          fi
+          
+          echo "| $ENVIRONMENT | $VERSION | $STATUS | $URL |" >> $GITHUB_STEP_SUMMARY
+          
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Service:** API Service" >> $GITHUB_STEP_SUMMARY
+          echo "**Deployment triggered by:** ${{ github.event_name }}" >> $GITHUB_STEP_SUMMARY
