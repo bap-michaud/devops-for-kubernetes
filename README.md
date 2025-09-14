@@ -86,13 +86,13 @@ The repository includes comprehensive GitHub Actions workflows:
 
 ### Pipeline Features
 
-- ✅ Self-hosted runner with direct cluster access
+- ✅ Hybrid runner approach (GitHub-hosted + self-hosted)
 - ✅ Selective builds (only changed services)
 - ✅ Multi-architecture support (AMD64/ARM64)
 - ✅ Dependency and Docker layer caching
 - ✅ Security scanning with Trivy and CodeQL
 - ✅ Container signing with Cosign
-- ✅ Direct deployment to dev cluster
+- ✅ Direct deployment to dev cluster via self-hosted runner
 
 ## 🔒 Security
 

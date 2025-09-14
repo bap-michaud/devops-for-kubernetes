@@ -26,7 +26,7 @@ permissions:
 
 jobs:
   detect-changes:
-    runs-on: self-hosted
+    runs-on: ubuntu-latest
     outputs:
       web-app: ${{ steps.changes.outputs.web-app }}
       api-service: ${{ steps.changes.outputs.api-service }}
@@ -71,7 +71,7 @@ jobs:
   build-and-push:
     needs: detect-changes
     if: needs.detect-changes.outputs.web-app == 'true' || needs.detect-changes.outputs.api-service == 'true' || github.event.inputs.force_build == 'true'
-    runs-on: self-hosted
+    runs-on: ubuntu-latest
     strategy:
       matrix:
         service: 
@@ -139,7 +139,7 @@ jobs:
           touch "/tmp/digests/${digest#sha256:}"
 
       - name: Upload digest
-        uses: actions/upload-artifact@v3
+        uses: actions/upload-artifact@v4
         with:
           name: digests-${{ matrix.service }}
           path: /tmp/digests/*
@@ -148,7 +148,7 @@ jobs:
 
   merge-and-sign:
     needs: [detect-changes, build-and-push]
-    runs-on: self-hosted
+    runs-on: ubuntu-latest
     strategy:
       matrix:
         service: 
@@ -159,7 +159,7 @@ jobs:
     
     steps:
       - name: Download digests
-        uses: actions/download-artifact@v3
+        uses: actions/download-artifact@v4
         with:
           name: digests-${{ matrix.service }}
           path: /tmp/digests
@@ -230,7 +230,7 @@ jobs:
           push-to-registry: true
 
       - name: Upload SBOM
-        uses: actions/upload-artifact@v3
+        uses: actions/upload-artifact@v4
         with:
           name: sbom-${{ matrix.service }}
           path: sbom-${{ matrix.service }}.spdx.json
@@ -238,7 +238,7 @@ jobs:
 
   vulnerability-scan:
     needs: [detect-changes, merge-and-sign]
-    runs-on: self-hosted
+    runs-on: ubuntu-latest
     strategy:
       matrix:
         service: 
@@ -280,7 +280,7 @@ jobs:
   update-deployment-manifests:
     needs: [detect-changes, vulnerability-scan]
     if: github.ref == 'refs/heads/main' && needs.detect-changes.outputs.is-release == 'false'
-    runs-on: self-hosted
+    runs-on: ubuntu-latest
     strategy:
       matrix:
         service: 
@@ -324,7 +324,7 @@ jobs:
   build-summary:
     needs: [detect-changes, build-and-push, merge-and-sign, vulnerability-scan]
     if: always()
-    runs-on: self-hosted
+    runs-on: ubuntu-latest
     
     steps:
       - name: Build Summary

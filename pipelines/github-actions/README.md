@@ -55,13 +55,20 @@ env:
   IMAGE_NAME: ${{ github.repository }}
 ```
 
-### Self-Hosted Runner Configuration
+### Hybrid Runner Configuration
 
-All workflows are configured to run on self-hosted runners with:
-- Direct access to the `dev` Kubernetes cluster
-- Pre-installed tooling (kubectl, Docker, Node.js)
-- Enhanced performance and security
-- Custom configurations for the development environment
+Workflows use a hybrid approach for optimal performance and cost efficiency:
+
+**GitHub-hosted runners (`ubuntu-latest`) for:**
+- Build and test operations
+- Security scanning (SAST, dependency, container scanning)
+- Container building and pushing
+- Artifact management
+- General CI operations
+
+**Self-hosted runners for:**
+- Kubernetes deployments requiring direct cluster access
+- Operations needing pre-configured kubectl context
 
 ### Build Matrix
 

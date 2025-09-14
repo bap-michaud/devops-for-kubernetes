@@ -38,7 +38,7 @@ permissions:
 
 jobs:
   determine-deployment:
-    runs-on: self-hosted
+    runs-on: ubuntu-latest
     outputs:
       environment: ${{ steps.env.outputs.environment }}
       services: ${{ steps.services.outputs.services }}
@@ -405,7 +405,7 @@ jobs:
   deployment-summary:
     needs: [determine-deployment, deploy-development, deploy-staging, deploy-production]
     if: always()
-    runs-on: self-hosted
+    runs-on: ubuntu-latest
     
     steps:
       - name: Deployment Summary

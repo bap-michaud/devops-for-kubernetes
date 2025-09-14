@@ -14,7 +14,7 @@ env:
 
 jobs:
   detect-changes:
-    runs-on: self-hosted
+    runs-on: ubuntu-latest
     outputs:
       web-app: ${{ steps.changes.outputs.web-app }}
       api-service: ${{ steps.changes.outputs.api-service }}
@@ -42,7 +42,7 @@ jobs:
   build-and-test:
     needs: detect-changes
     if: needs.detect-changes.outputs.web-app == 'true' || needs.detect-changes.outputs.api-service == 'true'
-    runs-on: self-hosted
+    runs-on: ubuntu-latest
     strategy:
       matrix:
         service: 
@@ -92,7 +92,7 @@ jobs:
         run: npm run test:coverage
 
       - name: Upload test results
-        uses: actions/upload-artifact@v3
+        uses: actions/upload-artifact@v4
         if: always()
         with:
           name: test-results-${{ matrix.service }}-${{ matrix.architecture }}
@@ -112,7 +112,7 @@ jobs:
   integration-tests:
     needs: [detect-changes, build-and-test]
     if: needs.detect-changes.outputs.web-app == 'true' && needs.detect-changes.outputs.api-service == 'true'
-    runs-on: self-hosted
+    runs-on: ubuntu-latest
     
     services:
       postgres:
@@ -175,7 +175,7 @@ jobs:
   build-summary:
     needs: [detect-changes, build-and-test, integration-tests]
     if: always()
-    runs-on: self-hosted
+    runs-on: ubuntu-latest
     
     steps:
       - name: Build Summary
