@@ -1,0 +1,235 @@
+# Default deny all ingress traffic
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: default-deny-ingress
+  namespace: default
+  labels:
+    app: devops-pipeline
+    component: security
+spec:
+  podSelector: {}
+  policyTypes:
+  - Ingress
+
+---
+# Default deny all egress traffic
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: default-deny-egress
+  namespace: default
+  labels:
+    app: devops-pipeline
+    component: security
+spec:
+  podSelector: {}
+  policyTypes:
+  - Egress
+
+---
+# Allow ingress to web-app from ingress controller
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: web-app-ingress
+  namespace: default
+  labels:
+    app: web-app
+    component: security
+spec:
+  podSelector:
+    matchLabels:
+      app: web-app
+  policyTypes:
+  - Ingress
+  ingress:
+  # Allow traffic from ingress controller
+  - from:
+    - namespaceSelector:
+        matchLabels:
+          name: ingress-nginx
+    - podSelector:
+        matchLabels:
+          app.kubernetes.io/name: ingress-nginx
+    ports:
+    - protocol: TCP
+      port: 3000
+  # Allow traffic from monitoring (Prometheus)
+  - from:
+    - namespaceSelector:
+        matchLabels:
+          name: monitoring
+    - podSelector:
+        matchLabels:
+          app: prometheus
+    ports:
+    - protocol: TCP
+      port: 9090
+
+---
+# Allow egress from web-app to api-service and external services
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: web-app-egress
+  namespace: default
+  labels:
+    app: web-app
+    component: security
+spec:
+  podSelector:
+    matchLabels:
+      app: web-app
+  policyTypes:
+  - Egress
+  egress:
+  # Allow traffic to api-service
+  - to:
+    - podSelector:
+        matchLabels:
+          app: api-service
+    ports:
+    - protocol: TCP
+      port: 8080
+  # Allow DNS resolution
+  - to: []
+    ports:
+    - protocol: UDP
+      port: 53
+    - protocol: TCP
+      port: 53
+  # Allow HTTPS to external services (CDNs, APIs)
+  - to: []
+    ports:
+    - protocol: TCP
+      port: 443
+  # Allow HTTP for health checks and metrics
+  - to: []
+    ports:
+    - protocol: TCP
+      port: 80
+
+---
+# Allow ingress to api-service from web-app and ingress controller
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: api-service-ingress
+  namespace: default
+  labels:
+    app: api-service
+    component: security
+spec:
+  podSelector:
+    matchLabels:
+      app: api-service
+  policyTypes:
+  - Ingress
+  ingress:
+  # Allow traffic from web-app
+  - from:
+    - podSelector:
+        matchLabels:
+          app: web-app
+    ports:
+    - protocol: TCP
+      port: 8080
+  # Allow traffic from ingress controller for direct API access
+  - from:
+    - namespaceSelector:
+        matchLabels:
+          name: ingress-nginx
+    - podSelector:
+        matchLabels:
+          app.kubernetes.io/name: ingress-nginx
+    ports:
+    - protocol: TCP
+      port: 8080
+  # Allow traffic from monitoring (Prometheus)
+  - from:
+    - namespaceSelector:
+        matchLabels:
+          name: monitoring
+    - podSelector:
+        matchLabels:
+          app: prometheus
+    ports:
+    - protocol: TCP
+      port: 9090
+
+---
+# Allow egress from api-service to external services
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: api-service-egress
+  namespace: default
+  labels:
+    app: api-service
+    component: security
+spec:
+  podSelector:
+    matchLabels:
+      app: api-service
+  policyTypes:
+  - Egress
+  egress:
+  # Allow DNS resolution
+  - to: []
+    ports:
+    - protocol: UDP
+      port: 53
+    - protocol: TCP
+      port: 53
+  # Allow HTTPS to external APIs and services
+  - to: []
+    ports:
+    - protocol: TCP
+      port: 443
+  # Allow HTTP for external services
+  - to: []
+    ports:
+    - protocol: TCP
+      port: 80
+  # Allow database connections (PostgreSQL)
+  - to:
+    - namespaceSelector:
+        matchLabels:
+          name: database
+    ports:
+    - protocol: TCP
+      port: 5432
+  # Allow Redis connections
+  - to:
+    - namespaceSelector:
+        matchLabels:
+          name: cache
+    ports:
+    - protocol: TCP
+      port: 6379
+
+---
+# Allow monitoring traffic across namespaces
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-monitoring
+  namespace: default
+  labels:
+    app: devops-pipeline
+    component: monitoring
+spec:
+  podSelector:
+    matchLabels:
+      prometheus.io/scrape: "true"
+  policyTypes:
+  - Ingress
+  ingress:
+  - from:
+    - namespaceSelector:
+        matchLabels:
+          name: monitoring
+    ports:
+    - protocol: TCP
+      port: 9090

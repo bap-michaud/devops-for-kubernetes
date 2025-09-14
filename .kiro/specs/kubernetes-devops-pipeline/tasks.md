@@ -6,20 +6,20 @@
   - Write Dockerfile with multi-stage build and security best practices
   - _Requirements: 1.1, 1.2_
 
-- [ ] 2. Implement Kubernetes manifests with resilience features
-  - [ ] 2.1 Create deployment manifest with resource management
+- [x] 2. Implement Kubernetes manifests with resilience features
+  - [x] 2.1 Create deployment manifest with resource management
     - Write Kubernetes Deployment with resource requests and limits
     - Configure readiness, liveness, and startup probes
     - Implement graceful shutdown with preStop hooks
     - _Requirements: 6.1, 6.5, 1.6_
 
-  - [ ] 2.2 Create service and networking configurations
+  - [x] 2.2 Create service and networking configurations
     - Write Service manifest for application exposure
     - Create Ingress configuration with proper annotations
     - Implement NetworkPolicy for security isolation
     - _Requirements: 6.3, 4.2_
 
-  - [ ] 2.3 Implement high availability and disruption management
+  - [x] 2.3 Implement high availability and disruption management
     - Create Pod Disruption Budget (PDB) configuration
     - Configure anti-affinity rules for multi-tenancy
     - Write HorizontalPodAutoscaler (HPA) manifest

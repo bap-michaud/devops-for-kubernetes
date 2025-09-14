@@ -1,0 +1,56 @@
+# Pod Disruption Budget for web-app
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: web-app-pdb
+  namespace: default
+  labels:
+    app: web-app
+    component: frontend
+  annotations:
+    kubernetes.io/description: "Ensures minimum availability during voluntary disruptions"
+spec:
+  minAvailable: 2  # Always keep at least 2 pods running
+  selector:
+    matchLabels:
+      app: web-app
+  unhealthyPodEvictionPolicy: AlwaysAllow
+
+---
+# Pod Disruption Budget for api-service
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: api-service-pdb
+  namespace: default
+  labels:
+    app: api-service
+    component: backend
+  annotations:
+    kubernetes.io/description: "Ensures minimum availability during voluntary disruptions"
+spec:
+  minAvailable: 2  # Always keep at least 2 pods running
+  selector:
+    matchLabels:
+      app: api-service
+  unhealthyPodEvictionPolicy: AlwaysAllow
+
+---
+# Alternative PDB configuration using maxUnavailable
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: web-app-pdb-percentage
+  namespace: default
+  labels:
+    app: web-app
+    component: frontend
+    strategy: percentage-based
+  annotations:
+    kubernetes.io/description: "Alternative PDB using percentage-based disruption limits"
+spec:
+  maxUnavailable: 33%  # Allow up to 33% of pods to be unavailable
+  selector:
+    matchLabels:
+      app: web-app
+  unhealthyPodEvictionPolicy: IfHealthyBudget

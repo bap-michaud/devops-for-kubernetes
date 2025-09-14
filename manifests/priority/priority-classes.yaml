@@ -1,0 +1,68 @@
+# High priority class for critical application workloads
+apiVersion: scheduling.k8s.io/v1
+kind: PriorityClass
+metadata:
+  name: high-priority-apps
+  labels:
+    component: scheduling
+  annotations:
+    kubernetes.io/description: "High priority class for critical application workloads"
+value: 1000
+globalDefault: false
+description: "Priority class for critical application workloads that should be scheduled before lower priority workloads"
+
+---
+# Medium priority class for standard application workloads
+apiVersion: scheduling.k8s.io/v1
+kind: PriorityClass
+metadata:
+  name: medium-priority-apps
+  labels:
+    component: scheduling
+  annotations:
+    kubernetes.io/description: "Medium priority class for standard application workloads"
+value: 500
+globalDefault: true
+description: "Default priority class for standard application workloads"
+
+---
+# Low priority class for batch jobs and non-critical workloads
+apiVersion: scheduling.k8s.io/v1
+kind: PriorityClass
+metadata:
+  name: low-priority-batch
+  labels:
+    component: scheduling
+  annotations:
+    kubernetes.io/description: "Low priority class for batch jobs and non-critical workloads"
+value: 100
+globalDefault: false
+description: "Priority class for batch jobs and non-critical workloads that can be preempted"
+
+---
+# System critical priority class for infrastructure components
+apiVersion: scheduling.k8s.io/v1
+kind: PriorityClass
+metadata:
+  name: system-critical
+  labels:
+    component: scheduling
+  annotations:
+    kubernetes.io/description: "System critical priority class for infrastructure components"
+value: 2000
+globalDefault: false
+description: "Priority class for system-critical infrastructure components like DNS, ingress controllers, and monitoring"
+
+---
+# Database priority class for stateful workloads
+apiVersion: scheduling.k8s.io/v1
+kind: PriorityClass
+metadata:
+  name: database-priority
+  labels:
+    component: scheduling
+  annotations:
+    kubernetes.io/description: "Priority class for database and stateful workloads"
+value: 1500
+globalDefault: false
+description: "Priority class for database and other stateful workloads that require stable scheduling"
